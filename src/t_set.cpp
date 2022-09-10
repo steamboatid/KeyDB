@@ -69,7 +69,8 @@ int setTypeAdd(robj *subject, const char *value) {
                 size_t max_entries = g_pserver->set_max_intset_entries;
                 /* limit to 1G entries due to intset internals. */
                 if (max_entries >= 1<<30) max_entries = 1<<30;
-                if (intsetLen((intset*)subject->m_ptr) > max_entries)
+                if (intsetLen((intset*)subject->m_ptr) > max_entries && 
+                    g_pserver->auto_convert_intset_encoding > 0)
                     setTypeConvert(subject,OBJ_ENCODING_HT);
                 return 1;
             }
@@ -81,6 +82,22 @@ int setTypeAdd(robj *subject, const char *value) {
              * encodable, so dictAdd should always work. */
             serverAssert(dictAdd((dict*)subject->m_ptr,sdsdup(value),NULL) == DICT_OK);
             return 1;
+        }
+    } else {
+        serverPanic("Unknown set encoding");
+    }
+    return 0;
+}
+
+int setTypeAddInt(robj *subject, const char *value) {
+    long long llval;
+    if (subject->encoding == OBJ_ENCODING_INTSET) {
+        if (isSdsRepresentableAsLongLong(value,&llval) == C_OK) {
+            uint8_t success = 0;
+            subject->m_ptr = intsetAdd((intset*)subject->m_ptr,llval,&success);
+            if (success) {
+                return 1;
+            }
         }
     } else {
         serverPanic("Unknown set encoding");
@@ -318,11 +335,43 @@ void saddCommand(client *c) {
     }
 
     for (j = 2; j < c->argc; j++) {
-        if (setTypeAdd(set,szFromObj(c->argv[j]))) added++;
+        if (set->encoding == OBJ_ENCODING_INTSET && 
+          g_pserver->auto_convert_intset_encoding == 0){
+					if (setTypeAddInt(set,szFromObj(c->argv[j]))) added++;
+				}
+				else {
+					if (setTypeAdd(set,szFromObj(c->argv[j]))) added++;
+				}
+
+				//serverLog(LL_NOTICE,"set encoding: %s, argc=%d", set->encoding==OBJ_ENCODING_INTSET? "intset" : "hashtable", j);
     }
     if (added) {
         signalModifiedKey(c,c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_SET,"sadd",c->argv[1],c->db->id);
+    }
+    g_pserver->dirty += added;
+    addReplyLongLong(c,added);
+}
+
+void saddintCommand(client *c) {
+    robj *set;
+    int j, added = 0;
+
+    set = lookupKeyWrite(c->db,c->argv[1]);
+    if (checkType(c,set,OBJ_SET)) return;
+
+    if (set == NULL) {
+        //set = setTypeCreate(szFromObj(c->argv[2]));
+        set = createIntsetObject(); //allways create intset
+        dbAdd(c->db,c->argv[1],set);
+    }
+
+    for (j = 2; j < c->argc; j++) {
+        if (setTypeAddInt(set,szFromObj(c->argv[j]))) added++;
+    }
+    if (added) {
+        signalModifiedKey(c,c->db,c->argv[1]);
+        notifyKeyspaceEvent(NOTIFY_SET,"saddint",c->argv[1],c->db->id);
     }
     g_pserver->dirty += added;
     addReplyLongLong(c,added);

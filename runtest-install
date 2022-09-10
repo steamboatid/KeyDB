@@ -1,0 +1,18 @@
+#!/bin/sh
+
+cd `mktemp -d`; apt remove --auto-remove --purge keydb* -fy; \
+rm -rf /var/lib/keydb /var/log/keydb /run/keydb /run/keydb
+
+cd /root/src/keydb
+dpkg -i keydb-server*deb keydb-tools*deb
+apt install -fy
+
+sleep 1; netstat -nlpat | grep --color keydb
+
+>/var/log/keydb/keydb-server.log;\
+systemctl daemon-reload; \
+ps auxw | grep keydb-server | awk '{print $2}' | xargs kill -9; \
+systemctl stop keydb-server; \
+ps auxw | grep keydb-server | awk '{print $2}' | xargs kill -9; \
+/etc/init.d/keydb-server restart; systemctl status keydb-server; \
+sleep 1; cat /var/log/keydb/keydb-server.log

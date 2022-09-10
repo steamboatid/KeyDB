@@ -1169,6 +1169,8 @@ void bitfieldGeneric(client *c, int flags) {
 
                 oldval = getUnsignedBitfield((unsigned char*)ptrFromObj(o),thisop->offset,
                         thisop->bits);
+								retval = oldval;
+								newval = oldval;
 
                 if (thisop->opcode == BITFIELDOP_INCRBY) {
                     newval = oldval + thisop->i64;

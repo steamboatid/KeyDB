@@ -12,7 +12,7 @@
  *
  * Compile with:
  *
- *  cc -O2 ./tracking_collisions.c ../src/crc64.c ../src/sha1.c
+ *  cc -O3 ./tracking_collisions.c ../src/crc64.c ../src/sha1.c
  *  ./a.out
  *
  * --------------------------------------------------------------------------

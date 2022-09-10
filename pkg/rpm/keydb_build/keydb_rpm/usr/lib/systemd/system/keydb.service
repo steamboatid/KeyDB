@@ -5,9 +5,15 @@ Documentation=https://docs.keydb.dev, man:keydb-server(1)
 
 [Service]
 Type=forking
+ExecStartPre=+/bin/mkdir -p /var/lib/keydb /var/log/keydb /run/keydb
+ExecStartPre=+/usr/bin/find -L /var/lib/keydb /var/log/keydb /run/keydb -type d -exec chmod 775 {} \;
+ExecStartPre=+/usr/bin/find -L /var/lib/keydb /var/log/keydb /run/keydb -type f -exec chmod 664 {} \;
+ExecStartPre=+/bin/chown keydb.keydb /etc/keydb /var/lib/keydb /var/log/keydb /run/keydb -Rfv
+# ExecStart=/usr/bin/keydb-server /etc/keydb/keydb.conf --supervised systemd --daemonize no
 ExecStart=/usr/bin/keydb-server /etc/keydb/keydb.conf
+ExecStartPost=/bin/sh -c "echo $MAINPID > /run/keydb/keydb-server.pid"
 ExecStop=/bin/kill -s TERM $MAINPID
-PIDFile=/var/run/keydb/keydb-server.pid
+PIDFile=/run/keydb/keydb-server.pid
 TimeoutStopSec=0
 Restart=always
 User=keydb
@@ -23,7 +29,7 @@ ProtectHome=yes
 ReadOnlyDirectories=/
 ReadWriteDirectories=-/var/lib/keydb
 ReadWriteDirectories=-/var/log/keydb
-ReadWriteDirectories=-/var/run/keydb
+ReadWriteDirectories=-/run/keydb
 
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_SETGID CAP_SETUID CAP_SYS_RESOURCE

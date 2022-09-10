@@ -3,10 +3,10 @@
 uname_S := $(shell sh -c 'uname -s 2>/dev/null || echo not')
 
 ifeq ($(uname_S),Darwin)
-	SHOBJ_CFLAGS ?= -W -Wall -dynamic -fno-common -g -ggdb -std=c99 -O2
+	SHOBJ_CFLAGS ?= -W -Wall -dynamic -fno-common -g -ggdb -std=c99 -O3
 	SHOBJ_LDFLAGS ?= -bundle -undefined dynamic_lookup
 else	# Linux, others
-	SHOBJ_CFLAGS ?= -W -Wall -fno-common -g -ggdb -std=c99 -O2
+	SHOBJ_CFLAGS ?= -W -Wall -fno-common -g -ggdb -std=c99 -O3
 	SHOBJ_LDFLAGS ?= -shared
 endif
 

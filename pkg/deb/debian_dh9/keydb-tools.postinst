@@ -40,6 +40,7 @@ then
 
 	Setup_dir /var/log/keydb ${USER}:adm 2750
 	Setup_dir /var/lib/keydb ${USER}:${USER} 750
+	Setup_dir /run/keydb ${USER}:${USER} 750
 fi
 
 #DEBHELPER#

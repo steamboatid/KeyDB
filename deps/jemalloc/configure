@@ -3420,13 +3420,13 @@ if test "$ac_test_CFLAGS" = set; then
   CFLAGS=$ac_save_CFLAGS
 elif test $ac_cv_prog_cc_g = yes; then
   if test "$GCC" = yes; then
-    CFLAGS="-g -O2"
+    CFLAGS="-g -O3"
   else
     CFLAGS="-g"
   fi
 else
   if test "$GCC" = yes; then
-    CFLAGS="-O2"
+    CFLAGS="-O3"
   else
     CFLAGS=
   fi
@@ -5038,13 +5038,13 @@ if test "$ac_test_CXXFLAGS" = set; then
   CXXFLAGS=$ac_save_CXXFLAGS
 elif test $ac_cv_prog_cxx_g = yes; then
   if test "$GXX" = yes; then
-    CXXFLAGS="-g -O2"
+    CXXFLAGS="-g -O3"
   else
     CXXFLAGS="-g"
   fi
 else
   if test "$GXX" = yes; then
-    CXXFLAGS="-O2"
+    CXXFLAGS="-O3"
   else
     CXXFLAGS=
   fi
@@ -9527,10 +9527,10 @@ fi
 
   elif test "x$je_cv_msvc" = "xyes" ; then
 
-{ $as_echo "$as_me:${as_lineno-$LINENO}: checking whether compiler supports -O2" >&5
-$as_echo_n "checking whether compiler supports -O2... " >&6; }
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking whether compiler supports -O3" >&5
+$as_echo_n "checking whether compiler supports -O3... " >&6; }
 T_CONFIGURE_CFLAGS="${CONFIGURE_CFLAGS}"
-T_APPEND_V=-O2
+T_APPEND_V=-O3
   if test "x${CONFIGURE_CFLAGS}" = "x" -o "x${T_APPEND_V}" = "x" ; then
   CONFIGURE_CFLAGS="${CONFIGURE_CFLAGS}${T_APPEND_V}"
 else
@@ -9559,7 +9559,7 @@ main ()
 }
 _ACEOF
 if ac_fn_c_try_compile "$LINENO"; then :
-  je_cv_cflags_added=-O2
+  je_cv_cflags_added=-O3
               { $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
 $as_echo "yes" >&6; }
 else
@@ -9578,10 +9578,10 @@ fi
 
 
 
-{ $as_echo "$as_me:${as_lineno-$LINENO}: checking whether compiler supports -O2" >&5
-$as_echo_n "checking whether compiler supports -O2... " >&6; }
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking whether compiler supports -O3" >&5
+$as_echo_n "checking whether compiler supports -O3... " >&6; }
 T_CONFIGURE_CXXFLAGS="${CONFIGURE_CXXFLAGS}"
-T_APPEND_V=-O2
+T_APPEND_V=-O3
   if test "x${CONFIGURE_CXXFLAGS}" = "x" -o "x${T_APPEND_V}" = "x" ; then
   CONFIGURE_CXXFLAGS="${CONFIGURE_CXXFLAGS}${T_APPEND_V}"
 else
@@ -9616,7 +9616,7 @@ main ()
 }
 _ACEOF
 if ac_fn_cxx_try_compile "$LINENO"; then :
-  je_cv_cxxflags_added=-O2
+  je_cv_cxxflags_added=-O3
               { $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
 $as_echo "yes" >&6; }
 else

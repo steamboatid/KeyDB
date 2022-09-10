@@ -1694,7 +1694,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int *error, uint64_t mvcc_ts
         /* Use a regular set when there are too many entries. */
         size_t max_entries = g_pserver->set_max_intset_entries;
         if (max_entries >= 1<<30) max_entries = 1<<30;
-        if (len > max_entries) {
+
+        if (len > max_entries && g_pserver->auto_convert_intset_encoding > 0) {
             o = createSetObject();
             /* It's faster to expand the dict to the right size asap in order
              * to avoid rehashing */
@@ -2081,7 +2082,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int *error, uint64_t mvcc_ts
                 }
                 o->type = OBJ_SET;
                 o->encoding = OBJ_ENCODING_INTSET;
-                if (intsetLen((intset*)ptrFromObj(o)) > g_pserver->set_max_intset_entries)
+                if (intsetLen((intset*)ptrFromObj(o)) > g_pserver->set_max_intset_entries && 
+                    g_pserver->auto_convert_intset_encoding > 0)
                     setTypeConvert(o,OBJ_ENCODING_HT);
                 break;
             case RDB_TYPE_ZSET_ZIPLIST:

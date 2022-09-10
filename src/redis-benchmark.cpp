@@ -1903,6 +1903,13 @@ int main(int argc, const char **argv) {
             free(cmd);
         }
 
+        if (test_is_selected("saddint")) {
+            len = redisFormatCommand(&cmd,
+                "SADDINT myset%s element:__rand_int__",tag);
+            benchmark("SADDINT",cmd,len);
+            free(cmd);
+        }
+
         if (test_is_selected("hset")) {
             len = redisFormatCommand(&cmd,
                 "HSET myhash%s element:__rand_int__ %s",tag,data);

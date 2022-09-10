@@ -66,18 +66,18 @@ do
 # We then listen exlusively on UNIX sockets to avoid TCP port collisions:
 #
 #   $ sed -i -e 's@^port .*@port 0@' /etc/keydb/${NAME}-myname.conf
-#   $ sed -i -e 's@^\\(# \\)\\{0,1\\}unixsocket .*@unixsocket /var/run/${NAME}-myname/${BINARY}.sock@' /etc/keydb/${NAME}-myname.conf
+#   $ sed -i -e 's@^\\(# \\)\\{0,1\\}unixsocket .*@unixsocket /run/${NAME}-myname/${BINARY}.sock@' /etc/keydb/${NAME}-myname.conf
 #
 # ... and ensure we are logging, etc. in a unique location:
 #
 #   $ sed -i -e 's@^logfile .*@logfile /var/log/keydb/${BINARY}-myname.log@' /etc/keydb/${NAME}-myname.conf
-#   $ sed -i -e 's@^pidfile .*@pidfile /var/run/keydb-myname/${BINARY}.pid@' /etc/keydb/${NAME}-myname.conf
+#   $ sed -i -e 's@^pidfile .*@pidfile /run/keydb-myname/${BINARY}.pid@' /etc/keydb/${NAME}-myname.conf
 #
 # We can then start the service as follows, validating we are using our own
 # configuration:
 #
 #   $ systemctl start ${BINARY}@myname.service
-#   $ keydb-cli -s /var/run/${NAME}-myname/${BINARY}.sock info | grep config_file
+#   $ keydb-cli -s /run/${NAME}-myname/${BINARY}.sock info | grep config_file
 EOF
 		fi
 
@@ -89,25 +89,34 @@ Documentation=https://docs.keydb.dev, man:${BINARY}(1)
 
 [Service]
 Type=forking
+ExecStartPre=+/bin/mkdir -p /var/lib/keydb /var/log/keydb /run/keydb
+ExecStartPre=+/usr/bin/find -L /var/lib/keydb /var/log/keydb /run/keydb -type d -exec chmod 775 {} \;
+ExecStartPre=+/usr/bin/find -L /var/lib/keydb /var/log/keydb /run/keydb -type f -exec chmod 664 {} \;
+ExecStartPre=+/bin/chown keydb.keydb /etc/keydb /var/lib/keydb /var/log/keydb /run/keydb -Rfv
+# ExecStart=/usr/bin/${BINARY} /etc/keydb/${NAMESPACED}.conf --supervised systemd --daemonize no
 ExecStart=/usr/bin/${BINARY} /etc/keydb/${NAMESPACED}.conf
+ExecStartPost=/bin/sh -c "echo $MAINPID > /run/keydb/${NAMESPACED}.pid"
 ExecStop=/bin/kill -s TERM \$MAINPID
-PIDFile=/var/run/${NAMESPACED}/${BINARY}.pid
-TimeoutStopSec=0
+PIDFile=/run/${NAMESPACED}/${BINARY}.pid
+TimeoutStopSec=2s
+TimeoutStartSec=20
+RestartSec=2s
 Restart=always
 User=keydb
 Group=keydb
 RuntimeDirectory=${NAMESPACED}
 RuntimeDirectoryMode=2755
+KillMode=mixed
 
 UMask=007
 PrivateTmp=yes
-LimitNOFILE=65535
+LimitNOFILE=1048576
 PrivateDevices=yes
 ProtectHome=yes
 ReadOnlyDirectories=/
 ReadWriteDirectories=-/var/lib/keydb
 ReadWriteDirectories=-/var/log/keydb
-ReadWriteDirectories=-/var/run/${NAMESPACED}
+ReadWriteDirectories=-/run/${NAMESPACED}
 
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_SETGID CAP_SETUID CAP_SYS_RESOURCE${SYSTEMD_EXTRA}

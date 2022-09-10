@@ -289,7 +289,7 @@ inline bool operator!=(const void *p, const robj_sharedptr &rhs)
 #define RDB_EOF_MARK_SIZE 40
 #define CONFIG_REPL_BACKLOG_MIN_SIZE (1024*16)          /* 16k */
 #define CONFIG_BGSAVE_RETRY_DELAY 5 /* Wait a few secs before trying again. */
-#define CONFIG_DEFAULT_PID_FILE "/var/run/keydb.pid"
+#define CONFIG_DEFAULT_PID_FILE "/run/keydb/keydb-server.pid"
 #define CONFIG_DEFAULT_CLUSTER_CONFIG_FILE "nodes.conf"
 #define CONFIG_DEFAULT_UNIX_SOCKET_PERM 0
 #define CONFIG_DEFAULT_LOGFILE ""
@@ -472,6 +472,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
                                            and AOF client */
 #define CLIENT_REPL_RDBONLY (1ULL<<42) /* This client is a replica that only wants
                                           RDB without replication buffer. */
+#define CLIENT_PREVENT_LOGGING (1ULL<<43)  /* Prevent logging of command to slowlog */
 #define CLIENT_FORCE_REPLY (1ULL<<44) /* Should addReply be forced to write the text? */
 
 /* Client block type (btype field in client structure)
@@ -2070,6 +2071,8 @@ struct redisServer {
     int module_blocked_pipe[2]; /* Pipe used to awake the event loop if a
                             client blocked on a module command needs
                             to be processed. */
+
+    int auto_convert_intset_encoding = 1; /* auto convert intset encoding (may ignore set_max_intset_entries) */
 };
 
 #define MAX_KEYS_BUFFER 256
@@ -2683,6 +2686,7 @@ void redisOpArrayInit(redisOpArray *oa);
 void redisOpArrayFree(redisOpArray *oa);
 void forceCommandPropagation(client *c, int flags);
 void preventCommandPropagation(client *c);
+void preventCommandLogging(client *c);
 void preventCommandAOF(client *c);
 void preventCommandReplication(client *c);
 void slowlogPushCurrentCommand(client *c, struct redisCommand *cmd, ustime_t duration);
@@ -3017,7 +3021,9 @@ void ltrimCommand(client *c);
 void typeCommand(client *c);
 void lsetCommand(client *c);
 void saddCommand(client *c);
+void saddintCommand(client *c);
 void sremCommand(client *c);
+void sremintCommand(client *c);
 void smoveCommand(client *c);
 void sismemberCommand(client *c);
 void smismemberCommand(client *c);

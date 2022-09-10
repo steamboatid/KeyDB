@@ -1137,6 +1137,7 @@ int rewriteSetObject(rio *r, robj *key, robj *o) {
 
                 if (!rioWriteBulkCount(r,'*',2+cmd_items) ||
                     !rioWriteBulkString(r,"SADD",4) ||
+                    !rioWriteBulkString(r,"SADDINT",4) ||
                     !rioWriteBulkObject(r,key)) 
                 {
                     return 0;

@@ -62,6 +62,7 @@
 #include <sys/socket.h>
 #include <algorithm>
 #include <uuid/uuid.h>
+#include <mutex>
 #include <condition_variable>
 #include "aelocker.h"
 #include "motd.h"
@@ -401,7 +402,15 @@ struct redisCommand redisCommandTable[] = {
      "write use-memory fast @set",
      0,NULL,1,1,1,0,0,0},
 
+    {"saddint",saddintCommand,-3,
+     "write use-memory fast @set",
+     0,NULL,1,1,1,0,0,0},
+
     {"srem",sremCommand,-3,
+     "write fast @set",
+     0,NULL,1,1,1,0,0,0},
+
+    {"sremint",sremCommand,-3,
      "write fast @set",
      0,NULL,1,1,1,0,0,0},
 
@@ -7050,6 +7059,8 @@ int main(int argc, char **argv) {
     if (g_pserver->maxmemory > 0 && g_pserver->maxmemory < 1024*1024) {
         serverLog(LL_WARNING,"WARNING: You specified a maxmemory value that is less than 1MB (current value is %llu bytes). Are you sure this is what you really want?", g_pserver->maxmemory);
     }
+
+    serverLog(LL_NOTICE,"Auto convert intset encoding: %s", g_pserver->auto_convert_intset_encoding? "yes" : "no");
 
     redisSetCpuAffinity(g_pserver->server_cpulist);
     aeReleaseLock();    //Finally we can dump the lock

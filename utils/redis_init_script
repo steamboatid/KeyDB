@@ -15,7 +15,7 @@ REDISPORT=6379
 EXEC=/usr/local/bin/keydb-server
 CLIEXEC=/usr/local/bin/keydb-cli
 
-PIDFILE=/var/run/redis_${REDISPORT}.pid
+PIDFILE=/run/redis_${REDISPORT}.pid
 CONF="/etc/redis/${REDISPORT}.conf"
 
 case "$1" in

@@ -1,3 +1,62 @@
+keydb (6:6.2.1-1distribution_placeholder) codename_placeholder; urgency=medium
+
+  * This release of KeyDB is at parity with Redis 6.2.6. In addition, the following changes were included:
+  * Systemd support for release packages 
+  * Fixes to buffer overflows in the `BITOP SHIFT` and `CRON` commands 
+  * Server times are now computed on a seperate thread to improve performance 
+  * Now enforces syslog identity and facility as soon as possible 
+  * Removed erroneous use of LOG_... flags when using syslog 
+  * Fixed erroneous `#endif` leading to build errors on some platforms 
+  * Fixed the incorrect counting of client connections 
+  * Issues resolved: #355, #370
+
+ -- Ben Schermel <ben@eqalpha.com>  Wed, 17 Nov 2021 20:00:37 +0000
+
+keydb (6:6.2.0-1distribution_placeholder) codename_placeholder; urgency=medium
+
+  * Removed unused command line options(-a, -d, -P, -r, -q, --csv, -l, -I, -e, --precision, --cluster, --enable-tracking)
+  * --ms option changed to --time, added --clients, --host, --port, and --threads options
+  * Added keydb-diagnostic-tool
+  * Improved test reliability
+  * Fixed memory leak in keydb-benchmark
+  * Fixed a number of race conditions
+  * Fixed OSX build issues
+  * Feature parity with Redis 6.2.3
+  * Fixed Issues: #323 #325 #276
+
+ -- Ben Schermel <ben@eqalpha.com>  Thu, 12 Aug 2021 20:00:37 +0000
+
+keydb (6:6.0.18-1distribution_placeholder) codename_placeholder; urgency=medium
+
+  * 6.0.18 - This release contains a number of improvements to stability and performance. 
+  * Additional tests were added with improvements to existing test reliability
+  * Merged Redis 6.0.10 into KeyDB
+  * Issues resolved in this release: #214, #222, #238, #257, #273, #276, #285
+
+ -- Ben Schermel <ben@eqalpha.com>  Fri, 26 Mar 2021 16:00:00 +0000
+
+keydb (6:6.0.16-1distribution_placeholder) codename_placeholder; urgency=medium
+
+  * 6.0.16 - This release contains significant performance improvements as well as fixes to the following issues: #234, #236, #233, #207, #229, #231
+  * Reduced memory consumption when Active Replication is not used
+  * Reduced CPU consumption
+  * Improved TLS performance
+  * replica-quorum config for multi-master.Intended to be used with "replica-serve-stale-data no", if at least N replicas are connected we will consider our master link up and serve data.
+  * Subkey expires performance improvement for big sets
+
+ -- Ben Schermel <ben@eqalpha.com>  Mon, 28 Sep 2020 16:00:00 +0000
+
+keydb (6:6.0.13-1distribution_placeholder) codename_placeholder; urgency=medium
+
+  * 6.0.13 New features added: KEYDB.MEXISTS, REPLICAOF REMOVE, multi-master-no-forward configuration option
+  * KEYDB.MEXISTS - return exactly which keys exist in the database not just the count
+  * REPLICAOF REMOVE - Remove specific masters in a multi master setup
+  * multi-master-no-forward configuration option - Reduce network traffic in mesh topology multimaster setups
+  * Redis 6.0.5 feature parity
+  * Fixed Issues: 194 Bad directive or wrong number of arguments error on 'lazyfree-lazy-user-del no'; 209 Timeout using modules; 210 Databases are not merged on multi-master sync; 211 rpm packages now signed; 212 rpm file permissions updated
+
+ -- Ben Schermel <ben@eqalpha.com>  Mon, 13 Jul 2020 8:00:00 +0000
+
 keydb (6:6.0.9-1distribution_placeholder) codename_placeholder; urgency=medium
 
   * 6.0.9 Addressing issues 187 - cpu lockup with subkey expire, 190 - missing sentinel binary in keydb-tools. 

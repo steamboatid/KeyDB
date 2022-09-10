@@ -5,9 +5,15 @@ Documentation=https://docs.keydb.dev, man:keydb-sentinel(1)
 
 [Service]
 Type=forking
+ExecStartPre=+/bin/mkdir -p /var/lib/keydb /var/log/keydb /run/keydb
+ExecStartPre=+/usr/bin/find -L /var/lib/keydb /var/log/keydb /run/keydb -type d -exec chmod 775 {} \;
+ExecStartPre=+/usr/bin/find -L /var/lib/keydb /var/log/keydb /run/keydb -type f -exec chmod 664 {} \;
+ExecStartPre=+/bin/chown keydb.keydb /etc/keydb /var/lib/keydb /var/log/keydb /run/keydb -Rfv
+# ExecStart=/usr/bin/keydb-sentinel /etc/keydb/sentinel.conf --supervised systemd --daemonize no
 ExecStart=/usr/bin/keydb-sentinel /etc/keydb/sentinel.conf
+ExecStartPost=/bin/sh -c "echo $MAINPID > /run/keydb/keydb-sentinel.pid"
 ExecStop=/bin/kill -s TERM $MAINPID
-PIDFile=/var/run/sentinel/keydb-sentinel.pid
+PIDFile=/run/keydb/keydb-sentinel.pid
 TimeoutStopSec=0
 Restart=always
 User=keydb
@@ -23,7 +29,7 @@ ProtectHome=yes
 ReadOnlyDirectories=/
 ReadWriteDirectories=-/var/lib/keydb
 ReadWriteDirectories=-/var/log/keydb
-ReadWriteDirectories=-/var/run/sentinel
+ReadWriteDirectories=-/run/sentinel
 
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_SETGID CAP_SETUID CAP_SYS_RESOURCE

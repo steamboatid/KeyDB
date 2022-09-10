@@ -27,7 +27,7 @@ After=network-online.target
 ExecStart=/usr/local/bin/redis-server --supervised systemd --daemonize no
 ## Alternatively, have redis-server load a configuration file:
 #ExecStart=/usr/local/bin/redis-server /path/to/your/redis.conf
-LimitNOFILE=10032
+#LimitNOFILE=10032
 NoNewPrivileges=yes
 #OOMScoreAdjust=-900
 #PrivateTmp=yes
@@ -38,6 +38,13 @@ UMask=0077
 #User=redis
 #Group=redis
 #WorkingDirectory=/var/lib/redis
+
+Restart=always
+KillMode=mixed
+RestartSec=2s
+TimeoutStartSec=20s
+TimeoutStopSec=2s
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target

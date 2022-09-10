@@ -25,14 +25,14 @@ index 93ab9a4..24e6c79 100644
  # on a unix socket when not specified.
  #
 -# unixsocket /tmp/keydb.sock
-+# unixsocket /var/run/keydb/keydb-server.sock
++# unixsocket /run/keydb/keydb-server.sock
  # unixsocketperm 700
  
  # Close the connection after a client is idle for N seconds (0 to disable)
 @@ -133,7 +133,7 @@ tcp-keepalive 300
  
  # By default keydb does not run as a daemon. Use 'yes' if you need it.
- # Note that keydb will write a pid file in /var/run/keydb.pid when daemonized.
+ # Note that keydb will write a pid file in /run/keydb/keydb-server.pid when daemonized.
 -daemonize no
 +daemonize yes
  
@@ -42,8 +42,8 @@ index 93ab9a4..24e6c79 100644
  #
  # Creating a pid file is best effort: if keydb is not able to create it
  # nothing bad happens, the server will start and run normally.
--pidfile /var/run/keydb_6379.pid
-+pidfile /var/run/keydb/keydb-server.pid
+-pidfile /run/keydb_6379.pid
++pidfile /run/keydb/keydb-server.pid
  
  # Specify the server verbosity level.
  # This can be one of:
@@ -60,8 +60,8 @@ index 93ab9a4..24e6c79 100644
  # The Append Only File will also be created inside this directory.
  #
  # Note that you must specify a directory here, not a file name.
--dir ./
-+dir /var/lib/keydb
+-dir /var/lib/keydb
++dir /tmp
  
  ################################# REPLICATION #################################
  
@@ -79,22 +79,22 @@ index bc9a705..58a4c84 100644
  
 @@ -23,17 +24,17 @@ port 26379
  # By default keydb Sentinel does not run as a daemon. Use 'yes' if you need it.
- # Note that keydb will write a pid file in /var/run/keydb-sentinel.pid when
+ # Note that keydb will write a pid file in /run/keydb/keydb-sentinel.pid when
  # daemonized.
 -daemonize no
 +daemonize yes
  
  # When running daemonized, keydb Sentinel writes a pid file in
- # /var/run/keydb-sentinel.pid by default. You can specify a custom pid file
+ # /run/keydb/keydb-sentinel.pid by default. You can specify a custom pid file
  # location here.
--pidfile /var/run/keydb-sentinel.pid
-+pidfile /var/run/sentinel/keydb-sentinel.pid
+-pidfile /run/keydb-sentinel.pid
++pidfile /run/keydb/keydb-sentinel.pid
  
  # Specify the log file name. Also the empty string can be used to force
  # Sentinel to log on the standard output. Note that if you use standard
  # output for logging but daemonize, logs will be sent to /dev/null
--logfile ""
-+logfile /var/log/keydb/keydb-sentinel.log
+-logfile /var/log/keydb/sentinel.log
++logfile ""
  
  # sentinel announce-ip <ip>
  # sentinel announce-port <port>
@@ -102,8 +102,8 @@ index bc9a705..58a4c84 100644
  # For keydb Sentinel to chdir to /tmp at startup is the simplest thing
  # for the process to don't interfere with administrative tasks such as
  # unmounting filesystems.
--dir /tmp
-+dir /var/lib/keydb
+-dir /var/lib/keydb
++dir /tmp
  
  # sentinel monitor <master-name> <ip> <keydb-port> <quorum>
  #

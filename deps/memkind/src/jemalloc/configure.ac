@@ -991,8 +991,8 @@ if test "x$enable_debug" = "x0" ; then
     JE_CXXFLAGS_ADD([-O3])
     JE_CFLAGS_ADD([-funroll-loops])
   elif test "x$je_cv_msvc" = "xyes" ; then
-    JE_CFLAGS_ADD([-O2])
-    JE_CXXFLAGS_ADD([-O2])
+    JE_CFLAGS_ADD([-O3])
+    JE_CXXFLAGS_ADD([-O3])
   else
     JE_CFLAGS_ADD([-O])
     JE_CXXFLAGS_ADD([-O])
