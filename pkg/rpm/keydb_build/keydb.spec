@@ -1,13 +1,12 @@
 Name        : keydb
-Version     : 5.3.3
+Version     : 6.0.5
 Release     : 1%{?dist}
 Group       : Unspecified
 License     : BSD
-Packager    : EQ Alpha Technology
+Packager    : Snap Inc.
 
 URL         : https://keydb.dev
 Summary     : A persistent key-value database
-
 
 Requires:          /bin/awk
 Requires:          logrotate

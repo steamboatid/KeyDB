@@ -96,6 +96,8 @@ void blockClient(client *c, int btype) {
 
     c->flags |= CLIENT_BLOCKED;
     c->btype = btype;
+    if (btype == BLOCKED_ASYNC)
+        c->casyncOpsPending++;
     g_pserver->blocked_clients++;
     g_pserver->blocked_clients_by_type[btype]++;
     addClientToTimeoutTable(c);
@@ -152,7 +154,7 @@ void processUnblockedClients(int iel) {
             }
             /* Then process client if it has more data in it's buffer. */
             if (c->querybuf && sdslen(c->querybuf) > 0) {
-                processInputBuffer(c, CMD_CALL_FULL);
+                processInputBuffer(c, true /*fParse*/, CMD_CALL_FULL);
             }
         }
     }
@@ -199,6 +201,9 @@ void unblockClient(client *c) {
     } else if (c->btype == BLOCKED_MODULE) {
         if (moduleClientIsBlockedOnKeys(c)) unblockClientWaitingData(c);
         unblockClientFromModule(c);
+    } else if (c->btype == BLOCKED_ASYNC) {
+        serverAssert(c->casyncOpsPending > 0);
+        c->casyncOpsPending--;
     } else if (c->btype == BLOCKED_PAUSE) {
         listDelNode(g_pserver->paused_clients,c->paused_list_node);
         c->paused_list_node = NULL;

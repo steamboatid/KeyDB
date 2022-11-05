@@ -271,9 +271,6 @@ start_server {overrides {save ""} tags {"other"}} {
         assert_equal [$rd read] "OK"
 
         $rd reset
-
-        # skip reset ouptut
-        $rd read
         assert_equal [$rd read] "RESET"
 
         assert_no_match {*flags=O*} [r client list]
@@ -307,6 +304,8 @@ start_server {overrides {save ""} tags {"other"}} {
     }
 }
 
+# The test below doesn't make sense with forkless bg save
+if 0 {
 start_server {tags {"other"}} {
     test {Don't rehash if redis has child proecess} {
         r config set save ""
@@ -331,7 +330,7 @@ start_server {tags {"other"}} {
         r set k3 v3
         assert_match "*table size: 8192*" [r debug HTSTATS 9]
     }
-}
+}}
 
 proc read_proc_title {pid} {
     set fd [open "/proc/$pid/cmdline" "r"]

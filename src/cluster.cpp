@@ -771,7 +771,7 @@ unsigned long getClusterConnectionsCount(void) {
     /* We decrement the number of nodes by one, since there is the
      * "myself" node too in the list. Each node uses two file descriptors,
      * one incoming and one outgoing, thus the multiplication by 2. */
-    return g_pserver->cluster_enabled ?
+    return g_pserver->cluster_enabled && g_pserver->cluster != nullptr ?
            ((dictSize(g_pserver->cluster->nodes)-1)*2) : 0;
 }
 
@@ -785,7 +785,7 @@ unsigned long getClusterConnectionsCount(void) {
  * However if the key contains the {...} pattern, only the part between
  * { and } is hashed. This may be useful in the future to force certain
  * keys to be in the same node (assuming no resharding is in progress). */
-unsigned int keyHashSlot(char *key, int keylen) {
+unsigned int keyHashSlot(const char *key, int keylen) {
     int s, e; /* start-end indexes of { and } */
 
     for (s = 0; s < keylen; s++)
@@ -1525,7 +1525,9 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
                  * it's greater than our view but is not in the future
                  * (with 500 milliseconds tolerance) from the POV of our
                  * clock. */
-                if (pongtime <= (g_pserver->mstime+500) &&
+                mstime_t mstime;
+                __atomic_load(&g_pserver->mstime, &mstime, __ATOMIC_RELAXED);
+                if (pongtime <= (mstime+500) &&
                     pongtime > node->pong_received)
                 {
                     node->pong_received = pongtime;
@@ -4127,7 +4129,7 @@ int verifyClusterConfigWithData(void) {
 
     /* Make sure we only have keys in DB0. */
     for (j = 1; j < cserver.dbnum; j++) {
-        if (dictSize(g_pserver->db[j].dict)) return C_ERR;
+        if (g_pserver->db[j]->size()) return C_ERR;
     }
 
     /* Check that all the slots we see populated memory have a corresponding
@@ -4577,7 +4579,7 @@ NULL
         clusterReplyMultiBulkSlots(c);
     } else if (!strcasecmp(szFromObj(c->argv[1]),"flushslots") && c->argc == 2) {
         /* CLUSTER FLUSHSLOTS */
-        if (dictSize(g_pserver->db[0].dict) != 0) {
+        if (g_pserver->db[0]->size() != 0) {
             addReplyError(c,"DB must be empty to perform CLUSTER FLUSHSLOTS.");
             return;
         }
@@ -4914,7 +4916,7 @@ NULL
          * slots nor keys to accept to replicate some other node.
          * Slaves can switch to another master without issues. */
         if (nodeIsMaster(myself) &&
-            (myself->numslots != 0 || dictSize(g_pserver->db[0].dict) != 0)) {
+            (myself->numslots != 0 || g_pserver->db[0]->size() != 0)) {
             addReplyError(c,
                 "To set a master the node must be empty and "
                 "without assigned slots.");
@@ -5074,7 +5076,7 @@ NULL
 
         /* Slaves can be reset while containing data, but not master nodes
          * that must be empty. */
-        if (nodeIsMaster(myself) && dictSize(c->db->dict) != 0) {
+        if (nodeIsMaster(myself) && c->db->size() != 0) {
             addReplyError(c,"CLUSTER RESET can't be called with "
                             "master nodes containing keys");
             return;
@@ -5090,6 +5092,7 @@ NULL
 /* -----------------------------------------------------------------------------
  * DUMP, RESTORE and MIGRATE commands
  * -------------------------------------------------------------------------- */
+ssize_t rdbSaveAuxFieldStrStr(rio *rdb, const char *key, const char *val);
 
 /* Generates a DUMP-format representation of the object 'o', adding it to the
  * io stream pointed by 'rio'. This function can't fail. */
@@ -5102,6 +5105,10 @@ void createDumpPayload(rio *payload, robj_roptr o, robj *key) {
     rioInitWithBuffer(payload,sdsempty());
     serverAssert(rdbSaveObjectType(payload,o));
     serverAssert(rdbSaveObject(payload,o,key));
+    char szT[32];
+    uint64_t mvcc = mvccFromObj(o);
+    snprintf(szT, 32, "%" PRIu64, mvcc);
+    serverAssert(rdbSaveAuxFieldStrStr(payload,"mvcc-tstamp", szT) != -1);
 
     /* Write the footer, this is how it looks like:
      * ----------------+---------------------+---------------+
@@ -5285,6 +5292,21 @@ void restoreCommand(client *c) {
         addReplyError(c,"Bad data format");
         return;
     }
+    if (rdbLoadType(&payload) == RDB_OPCODE_AUX)
+    {
+        robj *auxkey, *auxval;
+        if ((auxkey = rdbLoadStringObject(&payload)) == NULL) goto eoferr;
+        if ((auxval = rdbLoadStringObject(&payload)) == NULL) {
+            decrRefCount(auxkey);
+            goto eoferr;
+        }
+        if (strcasecmp(szFromObj(auxkey), "mvcc-tstamp") == 0) {
+            setMvccTstamp(obj, strtoull(szFromObj(auxval), nullptr, 10));
+        }
+        decrRefCount(auxkey);
+        decrRefCount(auxval);
+    }
+eoferr:
 
     /* Remove the old key if needed. */
     int deleted = 0;
@@ -5562,7 +5584,8 @@ try_again:
     /* Create RESTORE payload and generate the protocol to call the command. */
     for (j = 0; j < num_keys; j++) {
         long long ttl = 0;
-        expireEntry *pexpire = getExpire(c->db,kv[j]);
+        std::unique_lock<fastlock> ul(g_expireLock);
+        expireEntry *pexpire = c->db->getExpire(kv[j]);
         long long expireat = INVALID_EXPIRE;
         if (pexpire != nullptr)
             pexpire->FGetPrimaryExpire(&expireat);
@@ -5853,7 +5876,7 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
     multiState *ms, _ms;
     multiCmd mc;
     int i, slot = 0, migrating_slot = 0, importing_slot = 0, missing_keys = 0;
-    serverAssert(GlobalLocksAcquired());
+    serverAssert((c->cmd->flags & CMD_ASYNC_OK) || GlobalLocksAcquired());
 
     /* Allow any key to be set if a module disabled cluster redirections. */
     if (g_pserver->cluster_module_flags & CLUSTER_MODULE_FLAG_NO_REDIRECTION)
@@ -5959,7 +5982,7 @@ clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, in
 
             /* Migrating / Importing slot? Count keys we don't have. */
             if ((migrating_slot || importing_slot) &&
-                lookupKeyRead(&g_pserver->db[0],thiskey) == nullptr)
+                lookupKeyRead(g_pserver->db[0],thiskey) == nullptr)
             {
                 missing_keys++;
             }

@@ -49,6 +49,43 @@ void freeNestedHashObject(robj_roptr o) {
     dictRelease((dict*)ptrFromObj(o));
 }
 
+class DbDictWrapper {
+public:
+    DbDictWrapper() = default;
+
+    DbDictWrapper(dict *d)
+        : m_dict(d)
+    {}
+
+    DbDictWrapper(redisDb *db)
+        : m_db(db)
+    {}
+
+    dict_iter find(const char *key) {
+        if (m_db != nullptr) {
+            return m_db->find(key);
+        } else if (m_dict != nullptr) {
+            dictEntry *de = dictFind(m_dict, key);
+            return dict_iter(m_dict, de);
+        }
+        return dict_iter(nullptr);
+    }
+
+    bool add(sds key, robj *val) {
+        bool result = false;
+        if (m_db != nullptr) {
+            result = m_db->insert(key, val, true);
+        } else if (m_dict != nullptr) {
+            result = dictAdd(m_dict, key, val) == DICT_OK;
+        }
+        return result;
+    }
+
+private:
+    redisDb *m_db = nullptr;
+    dict *m_dict = nullptr;
+};
+
 robj *fetchFromKey(redisDb *db, robj_roptr key) {
     const char *pchCur = szFromObj(key);
     const char *pchStart = pchCur;
@@ -64,15 +101,14 @@ robj *fetchFromKey(redisDb *db, robj_roptr key) {
                 throw shared.syntaxerr; // malformed
             }
 
-            dict *d = nullptr;
+            DbDictWrapper srcDb;
             if (o == nullptr)
-                d = db->dict;
+                srcDb = db;
             else
-                d = (dict*)ptrFromObj(o);
+                srcDb = (dict*)ptrFromObj(o);
             
             sdsstring str(pchStart, pchCur - pchStart);
-            dictEntry *de = dictFind(d, str.get());
-            o = (de != nullptr) ? (robj*)dictGetVal(de) : nullptr;
+            o = srcDb.find(str.get()).val();
 
             if (o == nullptr) throw shared.nokeyerr;   // Not Found
             serverAssert(o->type == OBJ_NESTEDHASH || o->type == OBJ_STRING || o->type == OBJ_LIST);
@@ -103,37 +139,37 @@ bool setWithKey(redisDb *db, robj_roptr key, robj *val, bool fCreateBuckets) {
                 throw shared.syntaxerr; // malformed
             }
 
-            dict *d = nullptr;
+            DbDictWrapper src;
             if (o == nullptr)
-                d = db->dict;
+                src = db;
             else
-                d = (dict*)ptrFromObj(o);
+                src = (dict*)ptrFromObj(o);
             
             sdsstring str(pchStart, pchCur - pchStart);
-            dictEntry *de = dictFind(d, str.get());
+            dict_iter di = src.find(str.get());
 
             if (pchCur == pchMax) {
                 val->addref();
-                if (de != nullptr) {
-                    decrRefCount((robj*)dictGetVal(de));
-                    dictSetVal(d, de, val);
+                if (di.val() != nullptr) {
+                    decrRefCount(di.val());
+                    di.setval(val);
                     return true;
                 } else {
-                    dictAdd(d, str.release(), val);
+                    src.add(str.release(), val);
                     return false;
                 }
             } else {
-                o = (de != nullptr) ? (robj*)dictGetVal(de) : nullptr;
+                o = di.val();
 
                 if (o == nullptr) {
                     if (!fCreateBuckets)
                         throw shared.nokeyerr;   // Not Found
                     o = createNestHashBucket();
-                    serverAssert(dictAdd(d, str.release(), o) == DICT_OK);
+                    serverAssert(src.add(str.release(), o));
                 } else if (o->type != OBJ_NESTEDHASH) {
                     decrRefCount(o);
                     o = createNestHashBucket();
-                    de->v.val = o;
+                    di.setval(o);
                 }
             }
 

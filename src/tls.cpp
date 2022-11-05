@@ -41,6 +41,12 @@
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <cstring>
+
+#include <sys/stat.h>
+#include <arpa/inet.h>
 
 #define REDIS_TLS_PROTO_TLSv1       (1<<0)
 #define REDIS_TLS_PROTO_TLSv1_1     (1<<1)
@@ -175,6 +181,12 @@ void tlsInitThread(void)
     pending_list = listCreate();
 }
 
+void tlsCleanupThread(void)
+{
+    if (pending_list)
+        listRelease(pending_list);
+}
+
 void tlsCleanup(void) {
     if (redis_tls_ctx) {
         SSL_CTX_free(redis_tls_ctx);
@@ -204,6 +216,18 @@ static int tlsPasswordCallback(char *buf, int size, int rwflag, void *u) {
     memcpy(buf, pass, pass_len);
 
     return (int) pass_len;
+}
+
+/* Given a path to a file, return the last time it was accessed (in seconds) */
+time_t getLastModifiedTime(const char* path){
+    struct stat path_stat;
+    stat(path, &path_stat);
+
+#ifdef __APPLE__
+    return path_stat.st_mtimespec.tv_sec;
+#else
+    return path_stat.st_mtime;
+#endif
 }
 
 /* Create a *base* SSL_CTX using the SSL configuration provided. The base context
@@ -310,6 +334,14 @@ int tlsConfigure(redisTLSContextConfig *ctx_config) {
         goto error;
     }
 
+    /* Update the last modified times for the TLS elements */
+    ctx_config->key_file_last_modified = getLastModifiedTime(ctx_config->key_file);
+    ctx_config->cert_file_last_modified = getLastModifiedTime(ctx_config->cert_file);
+    ctx_config->client_cert_file_last_modified = getLastModifiedTime(ctx_config->client_cert_file);
+    ctx_config->client_key_file_last_modified = getLastModifiedTime(ctx_config->client_key_file);
+    ctx_config->ca_cert_dir_last_modified = getLastModifiedTime(ctx_config->ca_cert_dir);
+    ctx_config->ca_cert_file_last_modified = getLastModifiedTime(ctx_config->ca_cert_file);
+
     protocols = parseProtocolsConfig(ctx_config->protocols);
     if (protocols == -1) goto error;
 
@@ -385,6 +417,31 @@ error:
     return C_ERR;
 }
 
+/* Reload TLS certificate from disk, effectively rotating it */
+void tlsReload(void){
+    /* We will only bother checking keys and certs if TLS is enabled, otherwise we would be calling 'stat' for no reason */
+    if (g_pserver->tls_rotation && (g_pserver->tls_port || g_pserver->tls_replication || g_pserver->tls_cluster)){
+
+        bool cert_file_modified = getLastModifiedTime(g_pserver->tls_ctx_config.cert_file) != g_pserver->tls_ctx_config.cert_file_last_modified;
+        bool key_file_modified = getLastModifiedTime(g_pserver->tls_ctx_config.key_file) != g_pserver->tls_ctx_config.key_file_last_modified;
+
+        bool client_cert_file_modified = g_pserver->tls_ctx_config.client_cert_file != NULL && getLastModifiedTime(g_pserver->tls_ctx_config.client_cert_file) != g_pserver->tls_ctx_config.client_cert_file_last_modified;
+        bool client_key_file_modified = g_pserver->tls_ctx_config.client_key_file != NULL && getLastModifiedTime(g_pserver->tls_ctx_config.client_key_file) != g_pserver->tls_ctx_config.client_key_file_last_modified;
+
+        bool ca_cert_file_modified = g_pserver->tls_ctx_config.ca_cert_file != NULL && getLastModifiedTime(g_pserver->tls_ctx_config.ca_cert_file) != g_pserver->tls_ctx_config.ca_cert_file_last_modified;
+        bool ca_cert_dir_modified = g_pserver->tls_ctx_config.ca_cert_dir != NULL && getLastModifiedTime(g_pserver->tls_ctx_config.ca_cert_dir) != g_pserver->tls_ctx_config.ca_cert_dir_last_modified;
+
+        if (cert_file_modified || key_file_modified || ca_cert_file_modified || ca_cert_dir_modified || client_cert_file_modified || client_key_file_modified){
+            serverLog(LL_NOTICE, "TLS certificates changed on disk, attempting to rotate.");
+            if (tlsConfigure(&g_pserver->tls_ctx_config) == C_ERR) {
+                serverLog(LL_NOTICE, "Error trying to rotate TLS certificates, TLS credentials remain unchanged.");
+            } else {
+                serverLog(LL_NOTICE, "TLS certificates rotated successfully.");
+            }
+        }
+    }
+}
+
 #ifdef TLS_DEBUGGING
 #define TLSCONN_DEBUG(fmt, ...) \
     serverLog(LL_DEBUG, "TLSCONN: " fmt, __VA_ARGS__)
@@ -427,6 +484,110 @@ typedef struct tls_connection {
     listNode *pending_list_node;
     aeEventLoop *el;
 } tls_connection;
+
+/* Check to see if a given client name matches against our allowlist.
+ * Return true if it does */
+bool tlsCheckAgainstAllowlist(const char * client){
+    /* Because of wildcard matching, we need to iterate over the entire set.
+     * If we were doing simply straight matching, we could just directly 
+     * check to see if the client name is in the set in O(1) time */
+    for (auto &client_pattern: g_pserver->tls_allowlist){
+        if (stringmatchlen(client_pattern.get(), client_pattern.size(), client, strlen(client), 1))
+            return true;
+    }
+    return false;
+}
+
+/* ASN1_STRING_get0_data was introduced in OPENSSL 1.1.1
+ * use ASN1_STRING_data for older versions where it is not available */
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#define ASN1_STRING_get0_data ASN1_STRING_data 
+#endif 
+
+class TCleanup {
+    std::function<void()> fn;
+
+public:
+    TCleanup(std::function<void()> fn)
+        : fn(fn)
+    {}
+
+    ~TCleanup() {
+        fn();
+    }
+};
+
+bool tlsValidateCertificateName(tls_connection* conn){
+    if (g_pserver->tls_allowlist.empty())
+        return true;    // Empty list implies acceptance of all
+
+    X509 * cert = SSL_get_peer_certificate(conn->ssl);
+    TCleanup certClen([cert]{X509_free(cert);});
+    
+    /* Check the common name (CN) of the certificate first */
+    X509_NAME_ENTRY * ne = X509_NAME_get_entry(X509_get_subject_name(cert), X509_NAME_get_index_by_NID(X509_get_subject_name(cert), NID_commonName, -1));
+    const char * commonName = reinterpret_cast<const char*>(ASN1_STRING_get0_data(X509_NAME_ENTRY_get_data(ne)));
+    
+    if (tlsCheckAgainstAllowlist(commonName))
+        return true;
+
+    /* If that fails, check through the subject alternative names (SANs) as well */
+    GENERAL_NAMES* subjectAltNames = (GENERAL_NAMES*)X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+    if (subjectAltNames != nullptr){
+        for (int i = 0; i < sk_GENERAL_NAME_num(subjectAltNames); i++)
+        {
+            GENERAL_NAME* generalName = sk_GENERAL_NAME_value(subjectAltNames, i);
+            /* Short circuit if one of the SANs match. 
+             * We only support DNS, EMAIL, URI, and IP (specifically IPv4) */
+            switch (generalName->type)
+            {
+                case GEN_EMAIL:
+                    if (tlsCheckAgainstAllowlist(reinterpret_cast<const char*>(ASN1_STRING_get0_data(generalName->d.rfc822Name)))){
+                        sk_GENERAL_NAME_pop_free(subjectAltNames, GENERAL_NAME_free);
+                        return true;
+                    }
+                    break;
+                case GEN_DNS:
+                    if (tlsCheckAgainstAllowlist(reinterpret_cast<const char*>(ASN1_STRING_get0_data(generalName->d.dNSName)))){
+                        sk_GENERAL_NAME_pop_free(subjectAltNames, GENERAL_NAME_free);
+                        return true;
+                    }
+                    break;
+                case GEN_URI:
+                    if (tlsCheckAgainstAllowlist(reinterpret_cast<const char*>(ASN1_STRING_get0_data(generalName->d.uniformResourceIdentifier)))){
+                        sk_GENERAL_NAME_pop_free(subjectAltNames, GENERAL_NAME_free);
+                        return true;
+                    }
+                    break;
+                case GEN_IPADD:
+                    {
+                        int ipLen = ASN1_STRING_length(generalName->d.iPAddress);
+                        if (ipLen == 4){ //IPv4 case
+                            char addr[INET_ADDRSTRLEN];
+                            inet_ntop(AF_INET, ASN1_STRING_get0_data(generalName->d.iPAddress), addr, INET_ADDRSTRLEN);
+                            if (tlsCheckAgainstAllowlist(addr)){
+                                sk_GENERAL_NAME_pop_free(subjectAltNames, GENERAL_NAME_free);
+                                return true;
+                            }
+                        } else if (ipLen == 16) { // IPv6 case
+                            /* We don't support IPv6 at the moment */
+                        }
+                    }
+                    break;     
+                default:
+                    break;
+            }
+        }
+        sk_GENERAL_NAME_pop_free(subjectAltNames, GENERAL_NAME_free);
+    }
+
+    /* If neither the CN nor the SANs match, update the SSL error and return false */
+    conn->c.last_errno = 0;
+    if (conn->ssl_error) zfree(conn->ssl_error);
+    conn->ssl_error = (char*)zmalloc(512);
+    snprintf(conn->ssl_error, 512, "Client CN (%s) and SANs not found in allowlist.", commonName);
+    return false;
+}
 
 static connection *createTLSConnection(int client_side) {
     SSL_CTX *ctx = redis_tls_ctx;
@@ -645,7 +806,12 @@ void tlsHandleEvent(tls_connection *conn, int mask) {
                 /* If not handled, it's an error */
                 conn->c.state = CONN_STATE_ERROR;
             } else {
-                conn->c.state = CONN_STATE_CONNECTED;
+                /* Validate name */
+                if (!tlsValidateCertificateName(conn)){
+                    conn->c.state = CONN_STATE_ERROR;
+                } else {
+                    conn->c.state = CONN_STATE_CONNECTED;
+                }
             }
 
             {
@@ -816,6 +982,9 @@ static int connTLSConnect(connection *conn_, const char *addr, int port, const c
 static int connTLSWrite(connection *conn_, const void *data, size_t data_len) {
     tls_connection *conn = (tls_connection *) conn_;
     int ret, ssl_err;
+
+    if (data_len == 0)
+        return 0;
 
     if (conn->c.state != CONN_STATE_CONNECTED) return -1;
     ERR_clear_error();
@@ -1090,6 +1259,9 @@ int tlsConfigure(redisTLSContextConfig *ctx_config) {
     return C_OK;
 }
 
+void tlsReload(void){
+}
+
 connection *connCreateTLS(void) { 
     return NULL;
 }
@@ -1110,6 +1282,7 @@ int tlsProcessPendingData() {
 }
 
 void tlsInitThread() {}
+void tlsCleanupThread(void) {}
 
 sds connTLSGetPeerCert(connection *conn_) {
     (void) conn_;

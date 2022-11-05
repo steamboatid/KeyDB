@@ -53,8 +53,9 @@ if [ "$codename" == "xenial" ]; then
 else
         sudo pbuilder create --distribution $codename
 fi
+
 sudo pbuilder --update
-sudo pbuilder --build *.dsc
+sudo pbuilder --build *.dsc  --logfile /mnt/pbuilderlog.log
 
 # move new packages to deb_files_generated and clean up
 cp /var/cache/pbuilder/result/*$version*.deb ../deb_files_generated

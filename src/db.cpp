@@ -36,9 +36,14 @@
 #include <signal.h>
 #include <ctype.h>
 
+// Needed for prefetch
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
+
 /* Database backup. */
 struct dbBackup {
-    redisDb *dbarray;
+    const redisDbPersistentDataSnapshot **dbarray;
     rax *slots_to_keys;
     uint64_t slots_keys_count[CLUSTER_SLOTS];
 };
@@ -47,9 +52,20 @@ struct dbBackup {
  * C-level DB API
  *----------------------------------------------------------------------------*/
 
-int keyIsExpired(redisDb *db, robj *key);
 int expireIfNeeded(redisDb *db, robj *key, robj *o);
-void dbOverwriteCore(redisDb *db, dictEntry *de, sds key, robj *val, bool fUpdateMvcc, bool fRemoveExpire);
+void slotToKeyUpdateKeyCore(const char *key, size_t keylen, int add);
+
+std::unique_ptr<expireEntry> deserializeExpire(sds key, const char *str, size_t cch, size_t *poffset);
+sds serializeStoredObjectAndExpire(redisDbPersistentData *db, const char *key, robj_roptr o);
+
+dictType dictChangeDescType {
+    dictSdsHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCompare,          /* key compare */
+    dictSdsDestructor,          /* key destructor */
+    nullptr                     /* val destructor */
+};
 
 /* Update LFU when an object is accessed.
  * Firstly, decrement the counter if the decrement time is reached.
@@ -65,22 +81,20 @@ void updateExpire(redisDb *db, sds key, robj *valOld, robj *valNew)
     serverAssert(valOld->FExpires());
     serverAssert(!valNew->FExpires());
     
-    auto itr = db->setexpire->find(key);
-    serverAssert(itr != db->setexpire->end());
+    serverAssert(db->FKeyExpires((const char*)key));
     
     valNew->SetFExpires(true);
     valOld->SetFExpires(false);
     return;
 }
 
-void updateDbValAccess(dictEntry *de, int flags)
+static void lookupKeyUpdateObj(robj *val, int flags)
 {
-    robj *val = (robj*)dictGetVal(de);
-
     /* Update the access time for the ageing algorithm.
-        * Don't do it if we have a saving child, as this will trigger
-        * a copy on write madness. */
-    if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH)){
+     * Don't do it if we have a saving child, as this will trigger
+     * a copy on write madness. */
+    if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH))
+    {
         if (g_pserver->maxmemory_policy & MAXMEMORY_FLAG_LFU) {
             updateLFU(val);
         } else {
@@ -89,24 +103,36 @@ void updateDbValAccess(dictEntry *de, int flags)
     }
 }
 
-
 /* Low level key lookup API, not actually called directly from commands
  * implementations that should instead rely on lookupKeyRead(),
  * lookupKeyWrite() and lookupKeyReadWithFlags(). */
-static robj *lookupKey(redisDb *db, robj *key, int flags) {
-    dictEntry *de = dictFind(db->dict,ptrFromObj(key));
-    if (de) {
-        robj *val = (robj*)dictGetVal(de);
-
-        updateDbValAccess(de, flags);
-
+static robj* lookupKey(redisDb *db, robj *key, int flags) {
+    auto itr = db->find(key);
+    if (itr) {
+        robj *val = itr.val();
+        lookupKeyUpdateObj(val, flags);
         if (flags & LOOKUP_UPDATEMVCC) {
             setMvccTstamp(val, getMvccTstamp());
+            db->trackkey(key, true /* fUpdate */);
         }
         return val;
     } else {
         return NULL;
     }
+}
+static robj_roptr lookupKeyConst(redisDb *db, robj *key, int flags) {
+    serverAssert((flags & LOOKUP_UPDATEMVCC) == 0);
+    robj_roptr val;
+    if (g_pserver->m_pstorageFactory)
+        val = db->find(szFromObj(key)).val();
+    else
+        val = db->find_cached_threadsafe(szFromObj(key)).val();
+    
+    if (val != nullptr) {
+        lookupKeyUpdateObj(val.unsafe_robjcast(), flags);
+        return val;
+    }
+    return nullptr;
 }
 
 /* Lookup a key for read operations, or return NULL if the key is not found
@@ -132,8 +158,7 @@ static robj *lookupKey(redisDb *db, robj *key, int flags) {
  * correctly report a key is expired on slaves even if the master is lagging
  * expiring our key via DELs in the replication link. */
 robj_roptr lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
-    robj *val;
-    serverAssert(GlobalLocksAcquired());
+    robj_roptr val;
 
     if (expireIfNeeded(db,key) == 1) {
         /* If we are in the context of a master, expireIfNeeded() returns 1
@@ -161,8 +186,8 @@ robj_roptr lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
             goto keymiss;
         }
     }
-    val = lookupKey(db,key,flags);
-    if (val == NULL)
+    val = lookupKeyConst(db,key,flags);
+    if (val == nullptr)
         goto keymiss;
     g_pserver->stat_keyspace_hits++;
     return val;
@@ -178,7 +203,42 @@ keymiss:
 /* Like lookupKeyReadWithFlags(), but does not use any flag, which is the
  * common case. */
 robj_roptr lookupKeyRead(redisDb *db, robj *key) {
+    serverAssert(GlobalLocksAcquired());
     return lookupKeyReadWithFlags(db,key,LOOKUP_NONE);
+}
+robj_roptr lookupKeyRead(redisDb *db, robj *key, uint64_t mvccCheckpoint, AeLocker &locker) {
+    robj_roptr o;
+
+    if (aeThreadOwnsLock()) {
+        return lookupKeyReadWithFlags(db,key,LOOKUP_NONE);
+    } else {
+        // This is an async command
+        if (keyIsExpired(db,key))
+            return nullptr;
+        int idb = db->id;
+        if (serverTL->rgdbSnapshot[idb] == nullptr || serverTL->rgdbSnapshot[idb]->mvccCheckpoint() < mvccCheckpoint) {
+            locker.arm(serverTL->current_client);
+            if (serverTL->rgdbSnapshot[idb] != nullptr) {
+                db->endSnapshot(serverTL->rgdbSnapshot[idb]);
+                serverTL->rgdbSnapshot[idb] = nullptr;
+            } else {
+                serverTL->rgdbSnapshot[idb] = db->createSnapshot(mvccCheckpoint, true);
+            }
+            if (serverTL->rgdbSnapshot[idb] == nullptr) {
+                // We still need to service the read
+                o = lookupKeyReadWithFlags(db,key,LOOKUP_NONE);
+                serverTL->disable_async_commands = true; // don't try this again
+            }
+            else {
+                locker.disarm();
+            }
+        }
+        if (serverTL->rgdbSnapshot[idb] != nullptr) {
+            o = serverTL->rgdbSnapshot[idb]->find_cached_threadsafe(szFromObj(key)).val();
+        }
+    }
+
+    return o;
 }
 
 /* Lookup a key for write operations, and as a side effect, if needed, expires
@@ -209,6 +269,11 @@ robj_roptr lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
     if (!o) SentReplyOnKeyMiss(c, reply);
     return o;
 }
+robj_roptr lookupKeyReadOrReply(client *c, robj *key, robj *reply, AeLocker &locker) {
+    robj_roptr o = lookupKeyRead(c->db, key, c->mvccCheckpoint, locker);
+    if (!o) SentReplyOnKeyMiss(c, reply);
+    return o;
+}
 
 robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
     robj *o = lookupKeyWrite(c->db, key);
@@ -216,16 +281,18 @@ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
     return o;
 }
 
-int dbAddCore(redisDb *db, sds key, robj *val, bool fUpdateMvcc) {
+bool dbAddCore(redisDb *db, sds key, robj *val, bool fUpdateMvcc, bool fAssumeNew = false, dict_iter *piterExisting = nullptr) {
     serverAssert(!val->FExpires());
-    sds copy = sdsdup(key);
-    int retval = dictAdd(db->dict, copy, val);
+    sds copy = sdsdupshared(key);
+    
     uint64_t mvcc = getMvccTstamp();
     if (fUpdateMvcc) {
         setMvccTstamp(val, mvcc);
     }
 
-    if (retval == DICT_OK)
+    bool fInserted = db->insert(copy, val, fAssumeNew, piterExisting);
+
+    if (fInserted)
     {
         signalKeyAsReady(db, key, val->type);
         if (g_pserver->cluster_enabled) slotToKeyAdd(key);
@@ -235,7 +302,7 @@ int dbAddCore(redisDb *db, sds key, robj *val, bool fUpdateMvcc) {
         sdsfree(copy);
     }
 
-    return retval;
+    return fInserted;
 }
 
 /* Add the key to the DB. It's up to the caller to increment the reference
@@ -244,26 +311,25 @@ int dbAddCore(redisDb *db, sds key, robj *val, bool fUpdateMvcc) {
  * The program is aborted if the key already exists. */
 void dbAdd(redisDb *db, robj *key, robj *val)
 {
-    int retval = dbAddCore(db, szFromObj(key), val, true /* fUpdateMvcc */);
-    serverAssertWithInfo(NULL,key,retval == DICT_OK);
+    bool fInserted = dbAddCore(db, szFromObj(key), val, true /* fUpdateMvcc */);
+    serverAssertWithInfo(NULL,key,fInserted);
 }
 
-void dbOverwriteCore(redisDb *db, dictEntry *de, sds keySds, robj *val, bool fUpdateMvcc, bool fRemoveExpire)
+void redisDb::dbOverwriteCore(redisDb::iter itr, sds keySds, robj *val, bool fUpdateMvcc, bool fRemoveExpire)
 {
-    dictEntry auxentry = *de;
-    robj *old = (robj*)dictGetVal(de);
+    robj *old = itr.val();
     redisObjectStack keyO;
     initStaticStringObject(keyO, keySds);
     robj *key = &keyO;
 
     if (old->FExpires()) {
         if (fRemoveExpire) {
-            removeExpire(db, key);
+            ::removeExpire(this, key);
         }
         else {
             if (val->getrefcount(std::memory_order_relaxed) == OBJ_SHARED_REFCOUNT)
                 val = dupStringObject(val);
-            updateExpire(db, (sds)dictGetKey(de), old, val);
+            ::updateExpire(this, itr.key(), old, val);
         }
     }
 
@@ -280,14 +346,13 @@ void dbOverwriteCore(redisDb *db, dictEntry *de, sds keySds, robj *val, bool fUp
     overwrite as two steps of unlink+add, so we still need to call the unlink 
     callback of the module. */
     moduleNotifyKeyUnlink(key,old);
-    dictSetVal(db->dict, de, val);
+    
+    if (g_pserver->lazyfree_lazy_server_del)
+        freeObjAsync(key, itr.val());
+    else
+        decrRefCount(itr.val());
 
-    if (g_pserver->lazyfree_lazy_server_del) {
-        freeObjAsync(key,old);
-        dictSetVal(db->dict, &auxentry, NULL);
-    }
-
-    dictFreeVal(db->dict, &auxentry);
+    updateValue(itr, val);
 }
 
 /* Overwrite an existing key with a new value. Incrementing the reference
@@ -295,11 +360,16 @@ void dbOverwriteCore(redisDb *db, dictEntry *de, sds keySds, robj *val, bool fUp
  * This function does not modify the expire time of the existing key.
  *
  * The program is aborted if the key was not already present. */
-void dbOverwrite(redisDb *db, robj *key, robj *val) {
-    dictEntry *de = dictFind(db->dict,ptrFromObj(key));
+void dbOverwrite(redisDb *db, robj *key, robj *val, bool fRemoveExpire, dict_iter *pitrExisting) {
+    redisDb::iter itr;
+    if (pitrExisting != nullptr)
+        itr = *pitrExisting;
+    else
+        itr = db->find(key);
 
-    serverAssertWithInfo(NULL,key,de != NULL);
-    dbOverwriteCore(db, de, szFromObj(key), val, !!g_pserver->fActiveReplica, false);
+    serverAssertWithInfo(NULL,key,itr != nullptr);
+    lookupKeyUpdateObj(itr.val(), LOOKUP_NONE);
+    db->dbOverwriteCore(itr, szFromObj(key), val, !!g_pserver->fActiveReplica, fRemoveExpire);
 }
 
 /* Insert a key, handling duplicate keys according to fReplace */
@@ -307,14 +377,14 @@ int dbMerge(redisDb *db, sds key, robj *val, int fReplace)
 {
     if (fReplace)
     {
-        dictEntry *de = dictFind(db->dict, key);
-        if (de == nullptr)
-            return (dbAddCore(db, key, val, false /* fUpdateMvcc */) == DICT_OK);
+        auto itr = db->find(key);
+        if (itr == nullptr)
+            return (dbAddCore(db, key, val, false /* fUpdateMvcc */) == true);
 
-        robj *old = (robj*)dictGetVal(de);
+        robj_roptr old = itr.val();
         if (mvccFromObj(old) <= mvccFromObj(val))
         {
-            dbOverwriteCore(db, de, key, val, false, true);
+            db->dbOverwriteCore(itr, key, val, false, true);
             return true;
         }
 
@@ -322,7 +392,7 @@ int dbMerge(redisDb *db, sds key, robj *val, int fReplace)
     }
     else
     {
-        return (dbAddCore(db, key, val, true /* fUpdateMvcc */) == DICT_OK);
+        return (dbAddCore(db, key, val, true /* fUpdateMvcc */, true /* fAssumeNew */) == true);
     }
 }
 
@@ -338,12 +408,10 @@ int dbMerge(redisDb *db, sds key, robj *val, int fReplace)
  * The client 'c' argument may be set to NULL if the operation is performed
  * in a context where there is no clear client performing the operation. */
 void genericSetKey(client *c, redisDb *db, robj *key, robj *val, int keepttl, int signal) {
-    dictEntry *de = dictFind(db->dict, ptrFromObj(key));
-    if (de == NULL) {
-        dbAdd(db,key,val);
-    } else {
-        updateDbValAccess(de, LOOKUP_NONE);
-        dbOverwriteCore(db,de,szFromObj(key),val,!!g_pserver->fActiveReplica,!keepttl);
+    db->prepOverwriteForSnapshot(szFromObj(key));
+    dict_iter iter;
+    if (!dbAddCore(db, szFromObj(key), val, true /* fUpdateMvcc */, false /*fAssumeNew*/, &iter)) {
+        dbOverwrite(db, key, val, !keepttl, &iter);
     }
     incrRefCount(val);
     if (signal) signalModifiedKey(c,db,key);
@@ -359,21 +427,20 @@ void setKey(client *c, redisDb *db, robj *key, robj *val) {
  *
  * The function makes sure to return keys not already expired. */
 robj *dbRandomKey(redisDb *db) {
-    dictEntry *de;
     int maxtries = 100;
-    int allvolatile = dictSize(db->dict) == db->setexpire->size();
+    bool allvolatile = db->expireSize() == db->size();
 
     while(1) {
         sds key;
         robj *keyobj;
 
-        de = dictGetRandomKey(db->dict);
-        if (de == NULL) return NULL;
+        auto itr = db->random();
+        if (itr == nullptr) return NULL;
 
-        key = (sds)dictGetKey(de);
+        key = itr.key();
         keyobj = createStringObject(key,sdslen(key));
 
-        if (((robj*)dictGetVal(de))->FExpires())
+        if (itr.val()->FExpires())
         {
             if (allvolatile && listLength(g_pserver->masters) && --maxtries == 0) {
                 /* If the DB is composed only of keys with an expire set,
@@ -388,7 +455,7 @@ robj *dbRandomKey(redisDb *db) {
             }
         }
             
-        if (((robj*)dictGetVal(de))->FExpires())
+        if (itr.val()->FExpires())
         {
              if (expireIfNeeded(db,keyobj)) {
                 decrRefCount(keyobj);
@@ -400,24 +467,55 @@ robj *dbRandomKey(redisDb *db) {
     }
 }
 
-/* Delete a key, value, and associated expiration entry if any, from the DB */
-int dbSyncDelete(redisDb *db, robj *key) {
+bool redisDbPersistentData::syncDelete(robj *key)
+{
     /* Deleting an entry from the expires dict will not free the sds of
      * the key, because it is shared with the main dictionary. */
 
-    dictEntry *de = dictUnlink(db->dict,ptrFromObj(key));
-    if (de != nullptr && ((robj*)dictGetVal(de))->FExpires())
-        removeExpireCore(db, key, de);
-    if (de) {
-        robj *val = (robj*)dictGetVal(de);
+    auto itr = find(szFromObj(key));
+    if (itr != nullptr && itr.val()->FExpires())
+        removeExpire(key, itr);
+    
+    robj_sharedptr val(itr.val());
+    bool fDeleted = false;
+    if (m_spstorage != nullptr)
+        fDeleted = m_spstorage->erase(szFromObj(key));
+    fDeleted = (dictDelete(m_pdict,ptrFromObj(key)) == DICT_OK) || fDeleted;
+
+    if (fDeleted) {
         /* Tells the module that the key has been unlinked from the database. */
-        moduleNotifyKeyUnlink(key,val);
-        dictFreeUnlinkedEntry(db->dict,de);
+        moduleNotifyKeyUnlink(key,val); // MODULE Compat Note: We should be giving the actual key value here
+        
+        dictEntry *de = dictUnlink(m_dictChanged, szFromObj(key));
+        if (de != nullptr)
+        {
+            bool fUpdate = (bool)dictGetVal(de);
+            if (!fUpdate)
+                --m_cnewKeysPending;
+            dictFreeUnlinkedEntry(m_dictChanged, de);
+        }
+        
+        if (m_pdbSnapshot != nullptr)
+        {
+            auto itr = m_pdbSnapshot->find_cached_threadsafe(szFromObj(key));
+            if (itr != nullptr)
+            {
+                sds keyTombstone = sdsdupshared(itr.key());
+                uint64_t hash = dictGetHash(m_pdict, keyTombstone);
+                if (dictAdd(m_pdictTombstone, keyTombstone, (void*)hash) != DICT_OK)
+                    sdsfree(keyTombstone);
+            }
+        }
         if (g_pserver->cluster_enabled) slotToKeyDel(szFromObj(key));
         return 1;
     } else {
         return 0;
     }
+}
+
+/* Delete a key, value, and associated expiration entry if any, from the DB */
+int dbSyncDelete(redisDb *db, robj *key) {
+    return db->syncDelete(key);
 }
 
 /* This is a wrapper whose behavior depends on the Redis lazy free
@@ -471,7 +569,7 @@ robj *dbUnshareStringValue(redisDb *db, robj *key, robj *o) {
  * The dbnum can be -1 if all the DBs should be emptied, or the specified
  * DB index if we want to empty only a single database.
  * The function returns the number of keys removed from the database(s). */
-long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
+long long emptyDbStructure(redisDb **dbarray, int dbnum, int async,
                            void(callback)(void*))
 {
     long long removed = 0;
@@ -485,21 +583,16 @@ long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
     }
 
     for (int j = startdb; j <= enddb; j++) {
-        removed += dictSize(dbarray[j].dict);
-        if (async) {
-            emptyDbAsync(&dbarray[j]);
-        } else {
-            dictEmpty(dbarray[j].dict,callback);
-            dbarray[j].setexpire->clear();
-        }
+        removed += dbarray[j]->size();
+        dbarray[j]->clear(async, callback);
         /* Because all keys of database are removed, reset average ttl. */
-        dbarray[j].avg_ttl = 0;
+        dbarray[j]->avg_ttl = 0;
     }
 
     return removed;
 }
 
-/* Remove all keys from all the databases in a Redis server.
+/* Remove all keys from all the databases in a Redis DB.
  * If callback is given the function is called from time to time to
  * signal that work is in progress.
  *
@@ -554,16 +647,12 @@ long long emptyDb(int dbnum, int flags, void(callback)(void*)) {
 
 /* Store a backup of the database for later use, and put an empty one
  * instead of it. */
-dbBackup *backupDb(void) {
-    dbBackup *backup = (dbBackup*)zmalloc(sizeof(dbBackup));
-
-    /* Backup main DBs. */
-    backup->dbarray = (redisDb*)zmalloc(sizeof(redisDb)*cserver.dbnum);
+const dbBackup *backupDb(void) {
+    dbBackup *backup = new dbBackup();
+    
+    backup->dbarray = (const redisDbPersistentDataSnapshot**)zmalloc(sizeof(redisDbPersistentDataSnapshot*) * cserver.dbnum);
     for (int i=0; i<cserver.dbnum; i++) {
-        backup->dbarray[i] = g_pserver->db[i];
-        g_pserver->db[i].dict = dictCreate(&dbDictType,NULL);
-        g_pserver->db[i].setexpire = new(MALLOC_LOCAL) expireset;
-        g_pserver->db[i].expireitr = g_pserver->db[i].setexpire->end();
+        backup->dbarray[i] = g_pserver->db[i]->createSnapshot(LLONG_MAX, false);
     }
 
     /* Backup cluster slots to keys map if enable cluster. */
@@ -585,22 +674,21 @@ dbBackup *backupDb(void) {
 
 /* Discard a previously created backup, this can be slow (similar to FLUSHALL)
  * Arguments are similar to the ones of emptyDb, see EMPTYDB_ flags. */
-void discardDbBackup(dbBackup *buckup, int flags, void(callback)(void*)) {
+void discardDbBackup(const dbBackup *backup, int flags, void(callback)(void*)) {
+    UNUSED(callback);
     int async = (flags & EMPTYDB_ASYNC);
 
     /* Release main DBs backup . */
-    emptyDbStructure(buckup->dbarray, -1, async, callback);
     for (int i=0; i<cserver.dbnum; i++) {
-        dictRelease(buckup->dbarray[i].dict);
-        delete buckup->dbarray[i].setexpire;
+        g_pserver->db[i]->endSnapshot(backup->dbarray[i]);
     }
 
     /* Release slots to keys map backup if enable cluster. */
-    if (g_pserver->cluster_enabled) freeSlotsToKeysMap(buckup->slots_to_keys, async);
+    if (g_pserver->cluster_enabled) freeSlotsToKeysMap(backup->slots_to_keys, async);
 
     /* Release buckup. */
-    zfree(buckup->dbarray);
-    zfree(buckup);
+    zfree(backup->dbarray);
+    delete backup;
 
     moduleFireServerEvent(REDISMODULE_EVENT_REPL_BACKUP,
                           REDISMODULE_SUBEVENT_REPL_BACKUP_DISCARD,
@@ -611,28 +699,24 @@ void discardDbBackup(dbBackup *buckup, int flags, void(callback)(void*)) {
  * in the db).
  * This function should be called after the current contents of the database
  * was emptied with a previous call to emptyDb (possibly using the async mode). */
-void restoreDbBackup(dbBackup *buckup) {
+void restoreDbBackup(const dbBackup *backup) {
     /* Restore main DBs. */
     for (int i=0; i<cserver.dbnum; i++) {
-        serverAssert(dictSize(g_pserver->db[i].dict) == 0);
-        serverAssert(g_pserver->db[i].setexpire->empty());
-        dictRelease(g_pserver->db[i].dict);
-        delete g_pserver->db[i].setexpire;
-        g_pserver->db[i] = buckup->dbarray[i];
+        g_pserver->db[i]->restoreSnapshot(backup->dbarray[i]);
     }
-
+    
     /* Restore slots to keys map backup if enable cluster. */
     if (g_pserver->cluster_enabled) {
         serverAssert(g_pserver->cluster->slots_to_keys->numele == 0);
         raxFree(g_pserver->cluster->slots_to_keys);
-        g_pserver->cluster->slots_to_keys = buckup->slots_to_keys;
-        memcpy(g_pserver->cluster->slots_keys_count, buckup->slots_keys_count,
+        g_pserver->cluster->slots_to_keys = backup->slots_to_keys;
+        memcpy(g_pserver->cluster->slots_keys_count, backup->slots_keys_count,
                 sizeof(g_pserver->cluster->slots_keys_count));
     }
 
     /* Release buckup. */
-    zfree(buckup->dbarray);
-    zfree(buckup);
+    zfree(backup->dbarray);
+    delete backup;
 
     moduleFireServerEvent(REDISMODULE_EVENT_REPL_BACKUP,
                           REDISMODULE_SUBEVENT_REPL_BACKUP_RESTORE,
@@ -642,7 +726,7 @@ void restoreDbBackup(dbBackup *buckup) {
 int selectDb(client *c, int id) {
     if (id < 0 || id >= cserver.dbnum)
         return C_ERR;
-    c->db = &g_pserver->db[id];
+    c->db = g_pserver->db[id];
     return C_OK;
 }
 
@@ -650,7 +734,7 @@ long long dbTotalServerKeyCount() {
     long long total = 0;
     int j;
     for (j = 0; j < cserver.dbnum; j++) {
-        total += dictSize(g_pserver->db[j].dict);
+        total += g_pserver->db[j]->size();
     }
     return total;
 }
@@ -681,7 +765,7 @@ void signalFlushedDb(int dbid, int async) {
     }
 
     for (int j = startdb; j <= enddb; j++) {
-        touchAllWatchedKeysInDb(&g_pserver->db[j], NULL);
+        touchAllWatchedKeysInDb(g_pserver->db[j], NULL);
     }
 
     trackingInvalidateKeysOnFlush(async);
@@ -718,14 +802,14 @@ int getFlushCommandFlags(client *c, int *flags) {
 /* Flushes the whole server data set. */
 void flushAllDataAndResetRDB(int flags) {
     g_pserver->dirty += emptyDb(-1,flags,NULL);
-    if (g_pserver->child_type == CHILD_TYPE_RDB) killRDBChild();
+    if (g_pserver->FRdbSaveInProgress()) killRDBChild();
     if (g_pserver->saveparamslen > 0) {
         /* Normally rdbSave() will reset dirty, but we don't want this here
          * as otherwise FLUSHALL will not be replicated nor put into the AOF. */
         int saved_dirty = g_pserver->dirty;
         rdbSaveInfo rsi, *rsiptr;
         rsiptr = rdbPopulateSaveInfo(&rsi);
-        rdbSave(rsiptr);
+        rdbSave(nullptr, rsiptr);
         g_pserver->dirty = saved_dirty;
     }
     
@@ -747,6 +831,21 @@ void flushAllDataAndResetRDB(int flags) {
 void flushdbCommand(client *c) {
     int flags;
 
+    if (c->argc == 2)
+    {
+        if (!strcasecmp(szFromObj(c->argv[1]), "cache"))
+        {
+            if (g_pserver->m_pstorageFactory == nullptr)
+            {
+                addReplyError(c, "Cannot flush cache without a storage provider set");
+                return;
+            }
+            c->db->removeAllCachedValues();
+            addReply(c,shared.ok);
+            return;
+        }
+    }
+
     if (getFlushCommandFlags(c,&flags) == C_ERR) return;
     g_pserver->dirty += emptyDb(c->db->id,flags,NULL);
     addReply(c,shared.ok);
@@ -764,6 +863,23 @@ void flushdbCommand(client *c) {
  * Flushes the whole server data set. */
 void flushallCommand(client *c) {
     int flags;
+
+    if (c->argc == 2)
+    {
+        if (!strcasecmp(szFromObj(c->argv[1]), "cache"))
+        {
+            if (g_pserver->m_pstorageFactory == nullptr)
+            {
+                addReplyError(c, "Cannot flush cache without a storage provider set");
+                return;
+            }
+            for (int idb = 0; idb < cserver.dbnum; ++idb)
+                g_pserver->db[idb]->removeAllCachedValues();
+            addReply(c,shared.ok);
+            return;
+        }
+    }
+
     if (getFlushCommandFlags(c,&flags) == C_ERR) return;
     flushAllDataAndResetRDB(flags);
     addReply(c,shared.ok);
@@ -844,31 +960,136 @@ void randomkeyCommand(client *c) {
     decrRefCount(key);
 }
 
-void keysCommand(client *c) {
-    dictIterator *di;
-    dictEntry *de;
-    sds pattern = szFromObj(c->argv[1]);
+bool redisDbPersistentData::iterate(std::function<bool(const char*, robj*)> fn)
+{
+    dictIterator *di = dictGetSafeIterator(m_pdict);
+    dictEntry *de = nullptr;
+    bool fResult = true;
+    while(fResult && ((de = dictNext(di)) != nullptr))
+    {
+        if (!fn((const char*)dictGetKey(de), (robj*)dictGetVal(de)))
+            fResult = false;
+    }
+    dictReleaseIterator(di);
+
+    if (m_spstorage != nullptr)
+    {
+        bool fSawAll = fResult && m_spstorage->enumerate([&](const char *key, size_t cchKey, const void *, size_t )->bool{
+            sds sdsKey = sdsnewlen(key, cchKey);
+            bool fContinue = true;
+            if (dictFind(m_pdict, sdsKey) == nullptr)
+            {
+                ensure(sdsKey, &de);
+                fContinue = fn((const char*)dictGetKey(de), (robj*)dictGetVal(de));
+                removeCachedValue(sdsKey);
+            }
+            sdsfree(sdsKey);
+            return fContinue;
+        });
+        return fSawAll;
+    }
+
+    if (fResult && m_pdbSnapshot != nullptr)
+    {
+        fResult = m_pdbSnapshot->iterate_threadsafe([&](const char *key, robj_roptr){
+            // Before passing off to the user we need to make sure it's not already in the
+            //  the current set, and not deleted
+            dictEntry *deCurrent = dictFind(m_pdict, key);
+            if (deCurrent != nullptr)
+                return true;
+            dictEntry *deTombstone = dictFind(m_pdictTombstone, key);
+            if (deTombstone != nullptr)
+                return true;
+
+            // Alright it's a key in the use keyspace, lets ensure it and then pass it off
+            ensure(key);
+            deCurrent = dictFind(m_pdict, key);
+            return fn(key, (robj*)dictGetVal(deCurrent));
+        }, true /*fKeyOnly*/);
+    }
+    
+    return fResult;
+}
+
+client *createAOFClient(void);
+void freeFakeClient(client *);
+void keysCommandCore(client *cIn, const redisDbPersistentDataSnapshot *db, sds pattern)
+{
     int plen = sdslen(pattern), allkeys;
     unsigned long numkeys = 0;
+
+    client *c = createAOFClient();
+    c->flags |= CLIENT_FORCE_REPLY;
+
     void *replylen = addReplyDeferredLen(c);
 
-    di = dictGetSafeIterator(c->db->dict);
     allkeys = (pattern[0] == '*' && plen == 1);
-    while((de = dictNext(di)) != NULL) {
-        sds key = (sds)dictGetKey(de);
+    db->iterate_threadsafe([&](const char *key, robj_roptr)->bool {
         robj *keyobj;
 
         if (allkeys || stringmatchlen(pattern,plen,key,sdslen(key),0)) {
             keyobj = createStringObject(key,sdslen(key));
-            if (!keyIsExpired(c->db,keyobj)) {
+            if (!keyIsExpired(db,keyobj)) {
                 addReplyBulk(c,keyobj);
                 numkeys++;
             }
             decrRefCount(keyobj);
         }
-    }
-    dictReleaseIterator(di);
+        return !(cIn->flags.load(std::memory_order_relaxed) & CLIENT_CLOSE_ASAP);
+    }, true /*fKeyOnly*/);
+    
     setDeferredArrayLen(c,replylen,numkeys);
+
+    aeAcquireLock();
+    addReplyProto(cIn, c->buf, c->bufpos);
+    listIter li;
+    listNode *ln;
+    listRewind(c->reply, &li);
+    while ((ln = listNext(&li)) != nullptr)
+    {
+        clientReplyBlock *block = (clientReplyBlock*)listNodeValue(ln);
+        addReplyProto(cIn, block->buf(), block->used);
+    }
+    aeReleaseLock();
+    freeFakeClient(c);
+}
+
+int prepareClientToWrite(client *c, bool fAsync);
+void keysCommand(client *c) {
+    sds pattern = szFromObj(c->argv[1]);
+
+    const redisDbPersistentDataSnapshot *snapshot = nullptr;
+    if (!(c->flags & (CLIENT_MULTI | CLIENT_BLOCKED)))
+        snapshot = c->db->createSnapshot(c->mvccCheckpoint, true /* fOptional */);
+    if (snapshot != nullptr)
+    {
+        sds patternCopy = sdsdup(pattern);
+        aeEventLoop *el = serverTL->el;
+        blockClient(c, BLOCKED_ASYNC);
+        redisDb *db = c->db;
+        g_pserver->asyncworkqueue->AddWorkFunction([el, c, db, patternCopy, snapshot]{
+            keysCommandCore(c, snapshot, patternCopy);
+            sdsfree(patternCopy);
+            aePostFunction(el, [c, db, snapshot]{
+                aeReleaseLock();    // we need to lock with coordination of the client
+
+                std::unique_lock<decltype(c->lock)> lock(c->lock);
+                AeLocker locker;
+                locker.arm(c);
+
+                unblockClient(c);
+
+                locker.disarm();
+                lock.unlock();
+                db->endSnapshotAsync(snapshot);
+                aeAcquireLock();
+            });
+        });
+    }
+    else
+    {
+        keysCommandCore(c, c->db, pattern);
+    }
 }
 
 /* This callback is used by scanGenericCommand in order to collect elements
@@ -921,6 +1142,24 @@ int parseScanCursorOrReply(client *c, robj *o, unsigned long *cursor) {
     return C_OK;
 }
 
+
+static bool filterKey(robj_roptr kobj, sds pat, int patlen)
+{
+    bool filter = false;
+    if (sdsEncodedObject(kobj)) {
+        if (!stringmatchlen(pat, patlen, szFromObj(kobj), sdslen(szFromObj(kobj)), 0))
+            filter = true;
+    } else {
+        char buf[LONG_STR_SIZE];
+        int len;
+
+        serverAssert(kobj->encoding == OBJ_ENCODING_INT);
+        len = ll2string(buf,sizeof(buf),(long)ptrFromObj(kobj));
+        if (!stringmatchlen(pat, patlen, buf, len, 0)) filter = true;
+    }
+    return filter;
+}
+
 /* This command implements SCAN, HSCAN and SSCAN commands.
  * If object 'o' is passed, then it must be a Hash, Set or Zset object, otherwise
  * if 'o' is NULL the command will operate on the dictionary associated with
@@ -932,10 +1171,10 @@ int parseScanCursorOrReply(client *c, robj *o, unsigned long *cursor) {
  *
  * In the case of a Hash object the function returns both the field and value
  * of every element on the Hash. */
+void scanFilterAndReply(client *c, list *keys, sds pat, sds type, int use_pattern, robj_roptr o, unsigned long cursor);
 void scanGenericCommand(client *c, robj_roptr o, unsigned long cursor) {
     int i, j;
     list *keys = listCreate();
-    listNode *node, *nextnode;
     long count = 10;
     sds pat = NULL;
     sds type = NULL;
@@ -985,6 +1224,48 @@ void scanGenericCommand(client *c, robj_roptr o, unsigned long cursor) {
         }
     }
 
+    if (o == nullptr && count >= 100)
+    {
+        // Do an async version
+        if (c->asyncCommand(
+            [c, keys, pat, type, cursor, count, use_pattern] (const redisDbPersistentDataSnapshot *snapshot, const std::vector<robj_sharedptr> &) {
+                sds patCopy = pat ? sdsdup(pat) : nullptr;
+                sds typeCopy = type ? sdsdup(type) : nullptr;
+                auto cursorResult = snapshot->scan_threadsafe(cursor, count, typeCopy, keys);
+                if (use_pattern) {
+                    listNode *ln = listFirst(keys);
+                    int patlen = sdslen(patCopy);
+                    while (ln != nullptr)
+                    {
+                        listNode *next = ln->next;
+                        if (filterKey((robj*)listNodeValue(ln), patCopy, patlen))
+                        {
+                            robj *kobj = (robj*)listNodeValue(ln);
+                            decrRefCount(kobj);
+                            listDelNode(keys, ln);
+                        }
+                        ln = next;
+                    }
+                }
+                if (patCopy != nullptr)
+                    sdsfree(patCopy);
+                if (typeCopy != nullptr)
+                    sdsfree(typeCopy);
+                mstime_t timeScanFilter;
+                latencyStartMonitor(timeScanFilter);
+                scanFilterAndReply(c, keys, nullptr, nullptr, false, nullptr, cursorResult);
+                latencyEndMonitor(timeScanFilter);
+                latencyAddSampleIfNeeded("scan-async-filter", timeScanFilter);
+            },
+            [keys] (const redisDbPersistentDataSnapshot *) {
+                listSetFreeMethod(keys,decrRefCountVoid);
+                listRelease(keys);
+            }
+            )) {
+            return;
+        }
+    }
+
     /* Step 2: Iterate the collection.
      *
      * Note that if the object is encoded with a ziplist, intset, or any other
@@ -996,7 +1277,7 @@ void scanGenericCommand(client *c, robj_roptr o, unsigned long cursor) {
     /* Handle the case of a hash table. */
     ht = NULL;
     if (o == nullptr) {
-        ht = c->db->dict;
+        ht = c->db->dictUnsafeKeyOnly();
     } else if (o->type == OBJ_SET && o->encoding == OBJ_ENCODING_HT) {
         ht = (dict*)ptrFromObj(o);
     } else if (o->type == OBJ_HASH && o->encoding == OBJ_ENCODING_HT) {
@@ -1009,23 +1290,30 @@ void scanGenericCommand(client *c, robj_roptr o, unsigned long cursor) {
     }
 
     if (ht) {
-        void *privdata[2];
-        /* We set the max number of iterations to ten times the specified
-         * COUNT, so if the hash table is in a pathological state (very
-         * sparsely populated) we avoid to block too much time at the cost
-         * of returning no or very few elements. */
-        long maxiterations = count*10;
+        if (ht == c->db->dictUnsafeKeyOnly())
+        {
+            cursor = c->db->scan_threadsafe(cursor, count, nullptr, keys);
+        }
+        else
+        {
+            void *privdata[2];
+            /* We set the max number of iterations to ten times the specified
+            * COUNT, so if the hash table is in a pathological state (very
+            * sparsely populated) we avoid to block too much time at the cost
+            * of returning no or very few elements. */
+            long maxiterations = count*10;
 
-        /* We pass two pointers to the callback: the list to which it will
-         * add new elements, and the object containing the dictionary so that
-         * it is possible to fetch more data in a type-dependent way. */
-        privdata[0] = keys;
-        privdata[1] = o.unsafe_robjcast();
-        do {
-            cursor = dictScan(ht, cursor, scanCallback, NULL, privdata);
-        } while (cursor &&
-              maxiterations-- &&
-              listLength(keys) < (unsigned long)count);
+            /* We pass two pointers to the callback: the list to which it will
+            * add new elements, and the object containing the dictionary so that
+            * it is possible to fetch more data in a type-dependent way. */
+            privdata[0] = keys;
+            privdata[1] = o.unsafe_robjcast();
+            do {
+                cursor = dictScan(ht, cursor, scanCallback, NULL, privdata);
+            } while (cursor &&
+                maxiterations-- &&
+                listLength(keys) < (unsigned long)count);
+        }
     } else if (o->type == OBJ_SET) {
         int pos = 0;
         int64_t ll;
@@ -1051,6 +1339,18 @@ void scanGenericCommand(client *c, robj_roptr o, unsigned long cursor) {
         serverPanic("Not handled encoding in SCAN.");
     }
 
+    scanFilterAndReply(c, keys, pat, type, use_pattern, o, cursor);
+
+cleanup:
+    listSetFreeMethod(keys,decrRefCountVoid);
+    listRelease(keys);
+}
+
+void scanFilterAndReply(client *c, list *keys, sds pat, sds type, int use_pattern, robj_roptr o, unsigned long cursor)
+{
+    listNode *node, *nextnode;
+    int patlen = (pat != nullptr) ? sdslen(pat) : 0;
+    
     /* Step 3: Filter elements. */
     node = listFirst(keys);
     while (node) {
@@ -1060,17 +1360,8 @@ void scanGenericCommand(client *c, robj_roptr o, unsigned long cursor) {
 
         /* Filter element if it does not match the pattern. */
         if (use_pattern) {
-            if (sdsEncodedObject(kobj)) {
-                if (!stringmatchlen(pat, patlen, szFromObj(kobj), sdslen(szFromObj(kobj)), 0))
-                    filter = 1;
-            } else {
-                char buf[LONG_STR_SIZE];
-                int len;
-
-                serverAssert(kobj->encoding == OBJ_ENCODING_INT);
-                len = ll2string(buf,sizeof(buf),(long)ptrFromObj(kobj));
-                if (!stringmatchlen(pat, patlen, buf, len, 0)) filter = 1;
-            }
+            if (filterKey(kobj, pat, patlen))
+                filter = 1;
         }
 
         /* Filter an element if it isn't the type we want. */
@@ -1116,10 +1407,6 @@ void scanGenericCommand(client *c, robj_roptr o, unsigned long cursor) {
         decrRefCount(kobj);
         listDelNode(keys, node);
     }
-
-cleanup:
-    listSetFreeMethod(keys,decrRefCountVoid);
-    listRelease(keys);
 }
 
 /* The SCAN command completely relies on scanGenericCommand. */
@@ -1130,7 +1417,7 @@ void scanCommand(client *c) {
 }
 
 void dbsizeCommand(client *c) {
-    addReplyLongLong(c,dictSize(c->db->dict));
+    addReplyLongLong(c,c->db->size());
 }
 
 void lastsaveCommand(client *c) {
@@ -1175,6 +1462,11 @@ void shutdownCommand(client *c) {
             flags |= SHUTDOWN_NOSAVE;
         } else if (!strcasecmp(szFromObj(c->argv[1]),"save")) {
             flags |= SHUTDOWN_SAVE;
+        } else if (!strcasecmp(szFromObj(c->argv[1]), "soft")) {
+            g_pserver->soft_shutdown = true;
+            serverLog(LL_WARNING, "Soft Shutdown Initiated");
+            addReply(c, shared.ok);
+            return;
         } else {
             addReplyErrorObject(c,shared.syntaxerr);
             return;
@@ -1205,7 +1497,8 @@ void renameGenericCommand(client *c, int nx) {
     std::unique_ptr<expireEntry> spexpire;
 
     {   // scope pexpireOld since it will be invalid soon
-    expireEntry *pexpireOld = getExpire(c->db,c->argv[1]);
+    std::unique_lock<fastlock> ul(g_expireLock);
+    expireEntry *pexpireOld = c->db->getExpire(c->argv[1]);
     if (pexpireOld != nullptr)
         spexpire = std::make_unique<expireEntry>(std::move(*pexpireOld));
     }
@@ -1280,9 +1573,16 @@ void moveCommand(client *c) {
         return;
     }
 
+    /* Return zero if the key already exists in the target DB */
+    if (lookupKeyWrite(dst,c->argv[1]) != NULL) {
+        addReply(c,shared.czero);
+        return;
+    }
+
     std::unique_ptr<expireEntry> spexpire;
     {   // scope pexpireOld
-    expireEntry *pexpireOld = getExpire(c->db,c->argv[1]);
+    std::unique_lock<fastlock> ul(g_expireLock);
+    expireEntry *pexpireOld = c->db->getExpire(c->argv[1]);
     if (pexpireOld != nullptr)
         spexpire = std::make_unique<expireEntry>(std::move(*pexpireOld));
     }
@@ -1293,12 +1593,6 @@ void moveCommand(client *c) {
     dbDelete(src,c->argv[1]);
     g_pserver->dirty++;
 
-    /* Return zero if the key already exists in the target DB */
-    if (lookupKeyWrite(dst,c->argv[1]) != NULL) {
-        addReply(c,shared.czero);
-        decrRefCount(o);
-        return;
-    }
     dbAdd(dst,c->argv[1],o);
     if (spexpire != nullptr) setExpire(c,dst,c->argv[1],std::move(*spexpire));
 
@@ -1368,7 +1662,7 @@ void copyCommand(client *c) {
         addReply(c,shared.czero);
         return;
     }
-    expire = getExpire(c->db,key);
+    expire = c->db->getExpire(key);
 
     /* Return zero if the key already exists in the target DB. 
      * If REPLACE option is selected, delete newkey from targetDB. */
@@ -1442,16 +1736,14 @@ int dbSwapDatabases(int id1, int id2) {
     if (id1 < 0 || id1 >= cserver.dbnum ||
         id2 < 0 || id2 >= cserver.dbnum) return C_ERR;
     if (id1 == id2) return C_OK;
-    redisDb *db1 = &g_pserver->db[id1], *db2 = &g_pserver->db[id2];
+    std::swap(g_pserver->db[id1], g_pserver->db[id2]);
 
-    /* Swap hash tables. Note that we don't swap blocking_keys,
+    /* Note that we don't swap blocking_keys,
      * ready_keys and watched_keys, since we want clients to
-     * remain in the same DB they were. */
-    std::swap(db1->dict, db2->dict);
-    std::swap(db1->setexpire, db2->setexpire);
-    std::swap(db1->expireitr, db2->expireitr);
-    std::swap(db1->avg_ttl, db2->avg_ttl);
-    std::swap(db1->last_expire_set, db2->last_expire_set);
+     * remain in the same DB they were. so put them back */
+    std::swap(g_pserver->db[id1]->blocking_keys, g_pserver->db[id2]->blocking_keys);
+    std::swap(g_pserver->db[id2]->ready_keys, g_pserver->db[id2]->ready_keys);
+    std::swap(g_pserver->db[id2]->watched_keys, g_pserver->db[id2]->watched_keys);
 
     /* Now we need to handle clients blocked on lists: as an effect
      * of swapping the two DBs, a client that was waiting for list
@@ -1465,10 +1757,10 @@ int dbSwapDatabases(int id1, int id2) {
      *
      * Also the swapdb should make transaction fail if there is any
      * client watching keys */
-    scanDatabaseForReadyLists(db1);
-    touchAllWatchedKeysInDb(db1, db2);
-    scanDatabaseForReadyLists(db2);
-    touchAllWatchedKeysInDb(db2, db1);
+    scanDatabaseForReadyLists(g_pserver->db[id1]);
+    touchAllWatchedKeysInDb(g_pserver->db[id1], g_pserver->db[id2]);
+    scanDatabaseForReadyLists(g_pserver->db[id2]);
+    touchAllWatchedKeysInDb(g_pserver->db[id2], g_pserver->db[id1]);
     return C_OK;
 }
 
@@ -1507,37 +1799,39 @@ void swapdbCommand(client *c) {
  * Expires API
  *----------------------------------------------------------------------------*/
 int removeExpire(redisDb *db, robj *key) {
-    dictEntry *de = dictFind(db->dict,ptrFromObj(key));
-    return removeExpireCore(db, key, de);
+    auto itr = db->find(key);
+    return db->removeExpire(key, itr);
 }
-int removeExpireCore(redisDb *db, robj *key, dictEntry *de) {
+int redisDbPersistentData::removeExpire(robj *key, dict_iter itr) {
     /* An expire may only be removed if there is a corresponding entry in the
      * main dict. Otherwise, the key will never be freed. */
-    serverAssertWithInfo(NULL,key,de != NULL);
+    serverAssertWithInfo(NULL,key,itr != nullptr);
+    std::unique_lock<fastlock> ul(g_expireLock);
 
-    robj *val = (robj*)dictGetVal(de);
+    robj *val = itr.val();
     if (!val->FExpires())
         return 0;
 
-    auto itr = db->setexpire->find((sds)dictGetKey(de));
-    serverAssert(itr != db->setexpire->end());
-    serverAssert(itr->key() == (sds)dictGetKey(de));
-    db->setexpire->erase(itr);
+    trackkey(key, true /* fUpdate */);
+    auto itrExpire = m_setexpire->find(itr.key());
+    serverAssert(itrExpire != m_setexpire->end());
+    m_setexpire->erase(itrExpire);
     val->SetFExpires(false);
     return 1;
 }
 
-int removeSubkeyExpire(redisDb *db, robj *key, robj *subkey) {
-    dictEntry *de = dictFind(db->dict,ptrFromObj(key));
-    serverAssertWithInfo(NULL,key,de != NULL);
-    
-    robj *val = (robj*)dictGetVal(de);
+int redisDbPersistentData::removeSubkeyExpire(robj *key, robj *subkey) {
+    auto de = find(szFromObj(key));
+    serverAssertWithInfo(NULL,key,de != nullptr);
+    std::unique_lock<fastlock> ul(g_expireLock);
+
+    robj *val = de.val();
     if (!val->FExpires())
         return 0;
     
-    auto itr = db->setexpire->find((sds)dictGetKey(de));
-    serverAssert(itr != db->setexpire->end());
-    serverAssert(itr->key() == (sds)dictGetKey(de));
+    auto itr = m_setexpire->find(de.key());
+    serverAssert(itr != m_setexpire->end());
+    serverAssert(itr->key() == de.key());
     if (!itr->FFat())
         return 0;
 
@@ -1555,9 +1849,18 @@ int removeSubkeyExpire(redisDb *db, robj *key, robj *subkey) {
     }
 
     if (itr->pfatentry()->size() == 0)
-        removeExpireCore(db, key, de);
+        this->removeExpire(key, de);
 
     return found;
+}
+
+void redisDbPersistentData::resortExpire(expireEntry &e)
+{
+    std::unique_lock<fastlock> ul(g_expireLock);
+    auto itr = m_setexpire->find(e.key());
+    expireEntry eT = std::move(e);
+    m_setexpire->erase(itr);
+    m_setexpire->insert(eT);
 }
 
 /* Set an expire to the specified key. If the expire is set in the context
@@ -1565,49 +1868,24 @@ int removeSubkeyExpire(redisDb *db, robj *key, robj *subkey) {
  * to NULL. The 'when' parameter is the absolute unix time in milliseconds
  * after which the key will no longer be considered valid. */
 void setExpire(client *c, redisDb *db, robj *key, robj *subkey, long long when) {
-    dictEntry *kde;
-
     serverAssert(GlobalLocksAcquired());
-
-    /* Reuse the sds from the main dict in the expire dict */
-    kde = dictFind(db->dict,ptrFromObj(key));
-    serverAssertWithInfo(NULL,key,kde != NULL);
-
-    if (((robj*)dictGetVal(kde))->getrefcount(std::memory_order_relaxed) == OBJ_SHARED_REFCOUNT)
-    {
-        // shared objects cannot have the expire bit set, create a real object
-        dictSetVal(db->dict, kde, dupStringObject((robj*)dictGetVal(kde)));
-    }
 
     /* Update TTL stats (exponential moving average) */
     /*  Note: We never have to update this on expiry since we reduce it by the current elapsed time here */
-    long long now = g_pserver->mstime;
+    mstime_t now;
+    __atomic_load(&g_pserver->mstime, &now, __ATOMIC_ACQUIRE);
     db->avg_ttl -= (now - db->last_expire_set); // reduce the TTL by the time that has elapsed
-    if (db->setexpire->empty())
+    if (db->expireSize() == 0)
         db->avg_ttl = 0;
     else
-        db->avg_ttl -= db->avg_ttl / db->setexpire->size(); // slide one entry out the window
+        db->avg_ttl -= db->avg_ttl / db->expireSize(); // slide one entry out the window
     if (db->avg_ttl < 0)
         db->avg_ttl = 0;    // TTLs are never negative
-    db->avg_ttl += (double)(when-now) / (db->setexpire->size()+1);    // add the new entry
+    db->avg_ttl += (double)(when-now) / (db->expireSize()+1);    // add the new entry
     db->last_expire_set = now;
 
     /* Update the expire set */
-    const char *szSubKey = (subkey != nullptr) ? szFromObj(subkey) : nullptr;
-    if (((robj*)dictGetVal(kde))->FExpires()) {
-        auto itr = db->setexpire->find((sds)dictGetKey(kde));
-        serverAssert(itr != db->setexpire->end());
-        expireEntry eNew(std::move(*itr));
-        eNew.update(szSubKey, when);
-        db->setexpire->erase(itr);
-        db->setexpire->insert(eNew);
-    }
-    else
-    {
-        expireEntry e((sds)dictGetKey(kde), szSubKey, when);
-        ((robj*)dictGetVal(kde))->SetFExpires(true);
-        db->setexpire->insert(e);
-    }
+    db->setExpire(key, subkey, when);
 
     int writable_slave = listLength(g_pserver->masters) && g_pserver->repl_slave_ro == 0 && !g_pserver->fActiveReplica;
     if (c && writable_slave && !(c->flags & CLIENT_MASTER))
@@ -1624,26 +1902,24 @@ redisDb::~redisDb()
 
 void setExpire(client *c, redisDb *db, robj *key, expireEntry &&e)
 {
-    dictEntry *kde;
-
     serverAssert(GlobalLocksAcquired());
 
     /* Reuse the sds from the main dict in the expire dict */
-    kde = dictFind(db->dict,ptrFromObj(key));
+    auto kde = db->find(key);
     serverAssertWithInfo(NULL,key,kde != NULL);
 
-    if (((robj*)dictGetVal(kde))->getrefcount(std::memory_order_relaxed) == OBJ_SHARED_REFCOUNT)
+    if (kde.val()->getrefcount(std::memory_order_relaxed) == OBJ_SHARED_REFCOUNT)
     {
         // shared objects cannot have the expire bit set, create a real object
-        dictSetVal(db->dict, kde, dupStringObject((robj*)dictGetVal(kde)));
+        db->updateValue(kde, dupStringObject(kde.val()));
     }
 
-    if (((robj*)dictGetVal(kde))->FExpires())
+    if (kde.val()->FExpires())
         removeExpire(db, key);
 
-    e.setKeyUnsafe((sds)dictGetKey(kde));
-    db->setexpire->insert(e);
-    ((robj*)dictGetVal(kde))->SetFExpires(true);
+    e.setKeyUnsafe(kde.key());
+    db->setExpire(std::move(e));
+    kde.val()->SetFExpires(true);
 
 
     int writable_slave = listLength(g_pserver->masters) && g_pserver->repl_slave_ro == 0 && !g_pserver->fActiveReplica;
@@ -1653,22 +1929,20 @@ void setExpire(client *c, redisDb *db, robj *key, expireEntry &&e)
 
 /* Return the expire time of the specified key, or null if no expire
  * is associated with this key (i.e. the key is non volatile) */
-expireEntry *getExpire(redisDb *db, robj_roptr key) {
-    dictEntry *de;
-
+expireEntry *redisDbPersistentDataSnapshot::getExpire(const char *key) {
     /* No expire? return ASAP */
-    if (db->setexpire->size() == 0)
+    if (expireSize() == 0)
         return nullptr;
 
-    de = dictFind(db->dict, ptrFromObj(key));
-    if (de == NULL)
+    auto itrExpire = m_setexpire->find(key);
+    if (itrExpire == m_setexpire->end())
         return nullptr;
-    robj *obj = (robj*)dictGetVal(de);
-    if (!obj->FExpires())
-        return nullptr;
+    return itrExpire.operator->();
+}
 
-    auto itr = db->setexpire->find((sds)dictGetKey(de));
-    return itr.operator->();
+const expireEntry *redisDbPersistentDataSnapshot::getExpire(const char *key) const
+{
+    return const_cast<redisDbPersistentDataSnapshot*>(this)->getExpire(key);
 }
 
 /* Delete the specified expired key and propagate expire. */
@@ -1760,14 +2034,15 @@ void propagateSubkeyExpire(redisDb *db, int type, robj *key, robj *subkey)
 }
 
 /* Check if the key is expired. Note, this does not check subexpires */
-int keyIsExpired(redisDb *db, robj *key) {
-    expireEntry *pexpire = getExpire(db,key);
+int keyIsExpired(const redisDbPersistentDataSnapshot *db, robj *key) {
+    /* Don't expire anything while loading. It will be done later. */
+    if (g_pserver->loading) return 0;
+    
+    std::unique_lock<fastlock> ul(g_expireLock);
+    const expireEntry *pexpire = db->getExpire(key);
     mstime_t now;
 
     if (pexpire == nullptr) return 0; /* No expire for this key */
-
-    /* Don't expire anything while loading. It will be done later. */
-    if (g_pserver->loading) return 0;
 
     long long when = pexpire->FGetPrimaryExpire();
 
@@ -1790,7 +2065,7 @@ int keyIsExpired(redisDb *db, robj *key) {
      * open object in a next call, if the next call will see the key expired,
      * while the first did not. */
     else if (serverTL->fixed_time_expire > 0) {
-        now = g_pserver->mstime;
+        __atomic_load(&g_pserver->mstime, &now, __ATOMIC_ACQUIRE);
     }
     /* For the other cases, we want to use the most fresh time we have. */
     else {
@@ -2197,9 +2472,12 @@ int xreadGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult 
  * while rehashing the cluster and in other conditions when we need to
  * understand if we have keys for a given hash slot. */
 void slotToKeyUpdateKey(sds key, int add) {
+    slotToKeyUpdateKeyCore(key, sdslen(key), add);
+}
+
+void slotToKeyUpdateKeyCore(const char *key, size_t keylen, int add) {
     serverAssert(GlobalLocksAcquired());
 
-    size_t keylen = sdslen(key);
     unsigned int hashslot = keyHashSlot(key,keylen);
     unsigned char buf[64];
     unsigned char *indexed = buf;
@@ -2215,7 +2493,10 @@ void slotToKeyUpdateKey(sds key, int add) {
     } else {
         fModified = raxRemove(g_pserver->cluster->slots_to_keys,indexed,keylen+2,NULL);
     }
-    serverAssert(fModified);
+    // This assert is disabled when a snapshot depth is >0 because prepOverwriteForSnapshot will add in a tombstone,
+    //  this prevents ensure from adding the key to the dictionary which means the caller isn't aware we're already tracking
+    //  the key.
+    serverAssert(fModified || g_pserver->db[0]->snapshot_depth() > 0);
     if (indexed != buf) zfree(indexed);
 }
 
@@ -2286,7 +2567,7 @@ unsigned int delKeysInSlot(unsigned int hashslot) {
 
         auto count = g_pserver->cluster->slots_keys_count[hashslot];
         robj *key = createStringObject((char*)iter.key+2,iter.key_len-2);
-        dbDelete(&g_pserver->db[0],key);
+        dbDelete(g_pserver->db[0],key);
         serverAssert(count > g_pserver->cluster->slots_keys_count[hashslot]);   // we should have deleted something or we will be in an infinite loop
         decrRefCount(key);
         j++;
@@ -2297,4 +2578,818 @@ unsigned int delKeysInSlot(unsigned int hashslot) {
 
 unsigned int countKeysInSlot(unsigned int hashslot) {
     return g_pserver->cluster->slots_keys_count[hashslot];
+}
+
+void redisDbPersistentData::initialize()
+{
+    m_pdbSnapshot = nullptr;
+    m_pdict = dictCreate(&dbDictType,this);
+    m_pdictTombstone = dictCreate(&dbTombstoneDictType,this);
+    m_setexpire = new(MALLOC_LOCAL) expireset();
+    m_fAllChanged = 0;
+    m_fTrackingChanges = 0;
+}
+
+void redisDbPersistentData::setStorageProvider(StorageCache *pstorage)
+{
+    serverAssert(m_spstorage == nullptr);
+    m_spstorage = std::unique_ptr<StorageCache>(pstorage);
+}
+
+void redisDbPersistentData::endStorageProvider()
+{
+    serverAssert(m_spstorage != nullptr);
+    m_spstorage.reset();
+}
+
+void clusterStorageLoadCallback(const char *rgchkey, size_t cch, void *)
+{
+    slotToKeyUpdateKeyCore(rgchkey, cch, true /*add*/);
+}
+
+void redisDb::initialize(int id)
+{
+    redisDbPersistentData::initialize();
+    this->expireitr = setexpire()->end();
+    this->blocking_keys = dictCreate(&keylistDictType,NULL);
+    this->ready_keys = dictCreate(&objectKeyPointerValueDictType,NULL);
+    this->watched_keys = dictCreate(&keylistDictType,NULL);
+    this->id = id;
+    this->avg_ttl = 0;
+    this->last_expire_set = 0;
+    this->defrag_later = listCreate();
+    listSetFreeMethod(this->defrag_later,(void (*)(const void*))sdsfree);
+}
+
+void redisDb::storageProviderInitialize()
+{
+    if (g_pserver->m_pstorageFactory != nullptr)
+    {
+        IStorageFactory::key_load_iterator itr = (g_pserver->cluster_enabled) ? clusterStorageLoadCallback : nullptr;
+        this->setStorageProvider(StorageCache::create(g_pserver->m_pstorageFactory, id, itr, nullptr));
+    }
+}
+
+void redisDb::storageProviderDelete()
+{
+    if (g_pserver->m_pstorageFactory != nullptr)
+    {
+        this->endStorageProvider();
+    }
+}
+
+bool redisDbPersistentData::insert(char *key, robj *o, bool fAssumeNew, dict_iter *piterExisting)
+{
+    if (!fAssumeNew && (g_pserver->m_pstorageFactory != nullptr || m_pdbSnapshot != nullptr))
+        ensure(key);
+    dictEntry *de;
+    int res = dictAdd(m_pdict, key, o, &de);
+    if (!FImplies(fAssumeNew, res == DICT_OK)) {
+        serverLog(LL_WARNING,
+            "Assumed new key %s existed in DB.", key);
+    }
+    if (res == DICT_OK)
+    {
+#ifdef CHECKED_BUILD
+        if (m_pdbSnapshot != nullptr && m_pdbSnapshot->find_cached_threadsafe(key) != nullptr)
+        {
+            serverAssert(dictFind(m_pdictTombstone, key) != nullptr);
+        }
+#endif
+        trackkey(key, false /* fUpdate */);
+    }
+    else
+    {
+        if (piterExisting)
+            *piterExisting = dict_iter(m_pdict, de);
+    }
+    return (res == DICT_OK);
+}
+
+// This is a performance tool to prevent us copying over an object we're going to overwrite anyways
+void redisDbPersistentData::prepOverwriteForSnapshot(char *key)
+{
+    if (g_pserver->maxmemory_policy & MAXMEMORY_FLAG_LFU)
+        return;
+
+    if (m_pdbSnapshot != nullptr)
+    {
+        auto itr = m_pdbSnapshot->find_cached_threadsafe(key);
+        if (itr.key() != nullptr)
+        {
+            if (itr.val()->FExpires()) {
+                // Note: I'm sure we could handle this, but its too risky at the moment.
+                //  There are known bugs doing this with expires
+                return;
+            }
+            sds keyNew = sdsdupshared(itr.key());
+            if (dictAdd(m_pdictTombstone, keyNew, (void*)dictHashKey(m_pdict, key)) != DICT_OK)
+                sdsfree(keyNew);
+        }
+    }
+}
+
+void redisDbPersistentData::tryResize()
+{
+    if (htNeedsResize(m_pdict))
+        dictResize(m_pdict);
+}
+
+size_t redisDb::clear(bool fAsync, void(callback)(void*))
+{
+    size_t removed = size();
+    if (fAsync) {
+        redisDbPersistentData::emptyDbAsync();
+    } else {
+        redisDbPersistentData::clear(callback);
+    }
+    expireitr = setexpire()->end();
+    return removed;
+}
+
+void redisDbPersistentData::clear(void(callback)(void*))
+{
+    dictEmpty(m_pdict,callback);
+    if (m_fTrackingChanges)
+    {
+        dictEmpty(m_dictChanged, nullptr);
+        m_cnewKeysPending = 0;
+        m_fAllChanged++;
+    }
+    delete m_setexpire;
+    m_setexpire = new (MALLOC_LOCAL) expireset();
+    if (m_spstorage != nullptr)
+        m_spstorage->clear(callback);
+    dictEmpty(m_pdictTombstone,callback);
+    m_pdbSnapshot = nullptr;
+}
+
+void redisDbPersistentData::setExpire(robj *key, robj *subkey, long long when)
+{
+    /* Reuse the sds from the main dict in the expire dict */
+    std::unique_lock<fastlock> ul(g_expireLock);
+    dictEntry *kde = dictFind(m_pdict,ptrFromObj(key));
+    serverAssertWithInfo(NULL,key,kde != NULL);
+    trackkey(key, true /* fUpdate */);
+
+    if (((robj*)dictGetVal(kde))->getrefcount(std::memory_order_relaxed) == OBJ_SHARED_REFCOUNT)
+    {
+        // shared objects cannot have the expire bit set, create a real object
+        dictSetVal(m_pdict, kde, dupStringObject((robj*)dictGetVal(kde)));
+    }
+
+    const char *szSubKey = (subkey != nullptr) ? szFromObj(subkey) : nullptr;
+    if (((robj*)dictGetVal(kde))->FExpires()) {
+        auto itr = m_setexpire->find((sds)dictGetKey(kde));
+        serverAssert(itr != m_setexpire->end());
+        expireEntry eNew(std::move(*itr));
+        eNew.update(szSubKey, when);
+        m_setexpire->erase(itr);
+        m_setexpire->insert(eNew);
+    }
+    else
+    {
+        expireEntry e((sds)dictGetKey(kde), szSubKey, when);
+        ((robj*)dictGetVal(kde))->SetFExpires(true);
+        m_setexpire->insert(e);
+    }
+}
+
+void redisDbPersistentData::setExpire(expireEntry &&e)
+{
+    std::unique_lock<fastlock> ul(g_expireLock);
+    trackkey(e.key(), true /* fUpdate */);
+    m_setexpire->insert(e);
+}
+
+bool redisDb::FKeyExpires(const char *key)
+{
+    std::unique_lock<fastlock> ul(g_expireLock);
+    return setexpireUnsafe()->find(key) != setexpire()->end();
+}
+
+void redisDbPersistentData::updateValue(dict_iter itr, robj *val)
+{
+    trackkey(itr.key(), true /* fUpdate */);
+    dictSetVal(m_pdict, itr.de, val);
+}
+
+void redisDbPersistentData::ensure(const char *key)
+{
+    if (m_pdbSnapshot == nullptr && m_spstorage == nullptr)
+        return;
+    dictEntry *de = dictFind(m_pdict, key);
+    ensure(key, &de);
+}
+
+void redisDbPersistentData::ensure(const char *sdsKey, dictEntry **pde)
+{
+    serverAssert(sdsKey != nullptr);
+    serverAssert(FImplies(*pde != nullptr, dictGetVal(*pde) != nullptr));    // early versions set a NULL object, this is no longer valid
+    serverAssert(m_refCount == 0);
+    if (m_pdbSnapshot == nullptr && g_pserver->m_pstorageFactory == nullptr)
+        return;
+    std::unique_lock<fastlock> ul(g_expireLock);
+
+    // First see if the key can be obtained from a snapshot
+    if (*pde == nullptr && m_pdbSnapshot != nullptr)
+    {
+        dictEntry *deTombstone = dictFind(m_pdictTombstone, sdsKey);
+        if (deTombstone == nullptr)
+        {
+            auto itr = m_pdbSnapshot->find_cached_threadsafe(sdsKey);
+            if (itr == m_pdbSnapshot->end())
+                goto LNotFound;
+
+            sds keyNew = sdsdupshared(itr.key());   // note: we use the iterator's key because the sdsKey may not be a shared string
+            if (itr.val() != nullptr)
+            {
+                if (itr.val()->getrefcount(std::memory_order_relaxed) == OBJ_SHARED_REFCOUNT)
+                {
+                    dictAdd(m_pdict, keyNew, itr.val());
+                }
+                else
+                {
+                    sds strT = serializeStoredObject(itr.val());
+                    robj *objNew = deserializeStoredObject(this, sdsKey, strT, sdslen(strT));
+                    sdsfree(strT);
+                    dictAdd(m_pdict, keyNew, objNew);
+                    serverAssert(objNew->getrefcount(std::memory_order_relaxed) == 1);
+                    serverAssert(mvccFromObj(objNew) == mvccFromObj(itr.val()));
+                }
+            }
+            else
+            {
+                dictAdd(m_pdict, keyNew, nullptr);
+            }
+            uint64_t hash = dictGetHash(m_pdict, sdsKey);
+            dictEntry **deT;
+            dictht *ht;
+            *pde = dictFindWithPrev(m_pdict, sdsKey, hash, &deT, &ht);
+            dictAdd(m_pdictTombstone, sdsdupshared(itr.key()), (void*)hash);
+        }
+    }
+    
+LNotFound:
+    // If we haven't found it yet check our storage engine
+    if (*pde == nullptr && m_spstorage != nullptr)
+    {
+        if (dictSize(m_pdict) != size())    // if all keys are cached then no point in looking up the database
+        {
+            robj *o = nullptr;
+            sds sdsNewKey = sdsdupshared(sdsKey);
+            std::unique_ptr<expireEntry> spexpire;
+            m_spstorage->retrieve((sds)sdsKey, [&](const char *, size_t, const void *data, size_t cb){
+                size_t offset = 0;
+                spexpire = deserializeExpire(sdsNewKey, (const char*)data, cb, &offset);    
+                o = deserializeStoredObject(this, sdsNewKey, reinterpret_cast<const char*>(data) + offset, cb - offset);
+                serverAssert(o != nullptr);
+            });
+            
+            if (o != nullptr)
+            {
+                dictAdd(m_pdict, sdsNewKey, o);
+                o->SetFExpires(spexpire != nullptr);
+
+                if (spexpire != nullptr)
+                {
+                    auto itr = m_setexpire->find(sdsKey);
+                    if (itr != m_setexpire->end())
+                        m_setexpire->erase(itr);
+                    m_setexpire->insert(std::move(*spexpire));
+                    serverAssert(m_setexpire->find(sdsKey) != m_setexpire->end());
+                }
+                serverAssert(o->FExpires() == (m_setexpire->find(sdsKey) != m_setexpire->end()));
+                g_pserver->stat_storage_provider_read_hits++;
+            } else {
+                sdsfree(sdsNewKey);
+                g_pserver->stat_storage_provider_read_misses++;
+            }
+
+            *pde = dictFind(m_pdict, sdsKey);
+        }
+    }
+
+    if (*pde != nullptr && dictGetVal(*pde) != nullptr)
+    {
+        robj *o = (robj*)dictGetVal(*pde);
+        serverAssert(o->FExpires() == (m_setexpire->find(sdsKey) != m_setexpire->end()));
+    }
+}
+
+void redisDbPersistentData::storeKey(sds key, robj *o, bool fOverwrite)
+{
+    sds temp = serializeStoredObjectAndExpire(this, key, o);
+    m_spstorage->insert(key, temp, sdslen(temp), fOverwrite);
+    sdsfree(temp);
+}
+
+void redisDbPersistentData::storeDatabase()
+{
+    dictIterator *di = dictGetIterator(m_pdict);
+    dictEntry *de;
+    while ((de = dictNext(di)) != NULL) {
+        sds key = (sds)dictGetKey(de);
+        robj *o = (robj*)dictGetVal(de);
+        storeKey(key, o, false);
+    }
+    serverAssert(dictSize(m_pdict) == m_spstorage->count());
+    dictReleaseIterator(di);
+}
+
+/* static */ void redisDbPersistentData::serializeAndStoreChange(StorageCache *storage, redisDbPersistentData *db, const char *key, bool fUpdate)
+{
+    auto itr = db->find_cached_threadsafe(key);
+    if (itr == nullptr)
+        return;
+    robj *o = itr.val();
+    sds temp = serializeStoredObjectAndExpire(db, (const char*) itr.key(), o);
+    storage->insert((sds)key, temp, sdslen(temp), fUpdate);
+    sdsfree(temp);
+}
+
+bool redisDbPersistentData::processChanges(bool fSnapshot)
+{
+    serverAssert(GlobalLocksAcquired());
+
+    --m_fTrackingChanges;
+    serverAssert(m_fTrackingChanges >= 0);
+
+    if (m_spstorage != nullptr)
+    {
+        if (!m_fAllChanged && dictSize(m_dictChanged) == 0 && m_cnewKeysPending == 0)
+            return false;
+        m_spstorage->beginWriteBatch();
+        serverAssert(m_pdbSnapshotStorageFlush == nullptr);
+        if (fSnapshot && !m_fAllChanged && dictSize(m_dictChanged) > 100)
+        {
+            // Do a snapshot based process if possible
+            m_pdbSnapshotStorageFlush = createSnapshot(getMvccTstamp(), true /* optional */);
+            if (m_pdbSnapshotStorageFlush)
+            {
+                if (m_dictChangedStorageFlush)
+                    dictRelease(m_dictChangedStorageFlush);
+                m_dictChangedStorageFlush = m_dictChanged;
+                m_dictChanged = dictCreate(&dictChangeDescType, nullptr);
+            }
+        }
+        
+        if (m_pdbSnapshotStorageFlush == nullptr)
+        {
+            if (m_fAllChanged)
+            {
+                if (dictSize(m_pdict) > 0 || m_spstorage->count() > 0) { // in some cases we may have pre-sized the StorageCache's dict, and we don't want clear to ruin it
+                    m_spstorage->clearAsync();
+                    storeDatabase();
+                }
+                m_fAllChanged = 0;
+            }
+            else
+            {
+                dictIterator *di = dictGetIterator(m_dictChanged);
+                dictEntry *de;
+                while ((de = dictNext(di)) != nullptr)
+                {
+                    serializeAndStoreChange(m_spstorage.get(), this, (const char*)dictGetKey(de), (bool)dictGetVal(de));
+                }
+                dictReleaseIterator(di);
+            }
+        }
+        dictEmpty(m_dictChanged, nullptr);
+        m_cnewKeysPending = 0;
+    }
+    return (m_spstorage != nullptr);
+}
+
+void redisDbPersistentData::processChangesAsync(std::atomic<int> &pendingJobs)
+{
+    ++pendingJobs;
+    serverAssert(!m_fAllChanged);
+    dictEmpty(m_dictChanged, nullptr);
+    dict *dictNew = dictCreate(&dbDictType, nullptr);
+    std::swap(dictNew, m_pdict);
+    m_cnewKeysPending = 0;
+    g_pserver->asyncworkqueue->AddWorkFunction([dictNew, this, &pendingJobs]{
+        dictIterator *di = dictGetIterator(dictNew);
+        dictEntry *de;
+        std::vector<sds> veckeys;
+        std::vector<size_t> veccbkeys;
+        std::vector<sds> vecvals;
+        std::vector<size_t> veccbvals;
+        while ((de = dictNext(di)) != nullptr)
+        {
+            robj *o = (robj*)dictGetVal(de);
+            sds temp = serializeStoredObjectAndExpire(this, (const char*) dictGetKey(de), o);
+            veckeys.push_back((sds)dictGetKey(de));
+            veccbkeys.push_back(sdslen((sds)dictGetKey(de)));
+            vecvals.push_back(temp);
+            veccbvals.push_back(sdslen(temp));
+        }
+        m_spstorage->bulkInsert(veckeys.data(), veccbkeys.data(), vecvals.data(), veccbvals.data(), veckeys.size());
+        for (auto val : vecvals)
+            sdsfree(val);
+        dictReleaseIterator(di);
+        dictRelease(dictNew);
+        --pendingJobs;
+    });
+}
+
+void redisDbPersistentData::bulkStorageInsert(char **rgKeys, size_t *rgcbKeys, char **rgVals, size_t *rgcbVals, size_t celem)
+{
+    m_spstorage->bulkInsert(rgKeys, rgcbKeys, rgVals, rgcbVals, celem);
+}
+
+void redisDbPersistentData::commitChanges(const redisDbPersistentDataSnapshot **psnapshotFree)
+{
+    if (m_pdbSnapshotStorageFlush)
+    {
+        dictIterator *di = dictGetIterator(m_dictChangedStorageFlush);
+        dictEntry *de;
+        while ((de = dictNext(di)) != nullptr)
+        {
+            serializeAndStoreChange(m_spstorage.get(), (redisDbPersistentData*)m_pdbSnapshotStorageFlush, (const char*)dictGetKey(de), (bool)dictGetVal(de));
+        }
+        dictReleaseIterator(di);
+        dictRelease(m_dictChangedStorageFlush);
+        m_dictChangedStorageFlush = nullptr;
+        *psnapshotFree = m_pdbSnapshotStorageFlush;
+        m_pdbSnapshotStorageFlush = nullptr;
+    }
+    if (m_spstorage != nullptr)
+        m_spstorage->endWriteBatch();
+}
+
+redisDbPersistentData::~redisDbPersistentData()
+{
+    if (m_spdbSnapshotHOLDER != nullptr)
+        endSnapshot(m_spdbSnapshotHOLDER.get());
+    
+    //serverAssert(m_pdbSnapshot == nullptr);
+    serverAssert(m_refCount == 0);
+    //serverAssert(m_pdict->iterators == 0);
+    serverAssert(m_pdictTombstone == nullptr || m_pdictTombstone->pauserehash == 0);
+    dictRelease(m_pdict);
+    if (m_pdictTombstone)
+        dictRelease(m_pdictTombstone);
+
+    if (m_dictChanged)
+        dictRelease(m_dictChanged);
+    if (m_dictChangedStorageFlush)
+        dictRelease(m_dictChangedStorageFlush);
+    
+    delete m_setexpire;
+}
+
+dict_iter redisDbPersistentData::random()
+{
+    if (size() == 0)
+        return dict_iter(nullptr);
+    if (m_pdbSnapshot != nullptr && m_pdbSnapshot->size() > 0)
+    {
+        dict_iter iter(nullptr);
+        double pctInSnapshot = (double)m_pdbSnapshot->size() / (size() + m_pdbSnapshot->size());
+        double randval = (double)rand()/RAND_MAX;
+        if (randval <= pctInSnapshot)
+        {
+            iter = m_pdbSnapshot->random_cache_threadsafe();    // BUG: RANDOM doesn't consider keys not in RAM
+            ensure(iter.key());
+            dictEntry *de = dictFind(m_pdict, iter.key());
+            return dict_iter(m_pdict, de);
+        }
+    }
+    dictEntry *de = dictGetRandomKey(m_pdict);
+    if (de != nullptr)
+        ensure((const char*)dictGetKey(de), &de);
+    return dict_iter(m_pdict, de);
+}
+
+size_t redisDbPersistentData::size(bool fCachedOnly) const 
+{ 
+    if (m_spstorage != nullptr && !m_fAllChanged && !fCachedOnly)
+        return m_spstorage->count() + m_cnewKeysPending;
+    
+    return dictSize(m_pdict) 
+        + (m_pdbSnapshot ? (m_pdbSnapshot->size(fCachedOnly) - dictSize(m_pdictTombstone)) : 0); 
+}
+
+bool redisDbPersistentData::removeCachedValue(const char *key, dictEntry **ppde)
+{
+    serverAssert(m_spstorage != nullptr);
+    // First ensure its not a pending key
+    if (m_spstorage != nullptr)
+        m_spstorage->batch_lock();
+    
+    dictEntry *de = dictFind(m_dictChanged, key);
+    if (de != nullptr)
+    {
+        if (m_spstorage != nullptr)
+            m_spstorage->batch_unlock();
+        return false; // can't evict
+    }
+
+    // since we write ASAP the database already has a valid copy so safe to delete
+    if (ppde != nullptr) {
+        *ppde = dictUnlink(m_pdict, key);
+    } else {
+        dictDelete(m_pdict, key);
+    }
+
+    if (m_spstorage != nullptr)
+        m_spstorage->batch_unlock();
+    
+    return true;
+}
+
+redisDbPersistentData::redisDbPersistentData() {
+    m_dictChanged = dictCreate(&dictChangeDescType, nullptr);
+}
+
+void redisDbPersistentData::trackChanges(bool fBulk, size_t sizeHint)
+{
+    m_fTrackingChanges.fetch_add(1, std::memory_order_relaxed);
+    if (fBulk)
+        m_fAllChanged.fetch_add(1, std::memory_order_acq_rel);
+
+    if (sizeHint > 0)
+        dictExpand(m_dictChanged, sizeHint, false);
+}
+
+void redisDbPersistentData::removeAllCachedValues()
+{
+    // First we have to flush the tracked changes
+    if (m_fTrackingChanges)
+    {
+        if (processChanges(false))
+            commitChanges();
+        trackChanges(false);
+    }
+
+    if (m_pdict->pauserehash == 0 && m_pdict->refcount == 1) {
+        dict *dT = m_pdict;
+        m_pdict = dictCreate(&dbDictType, this);
+        dictExpand(m_pdict, dictSize(dT)/2, false); // Make room for about half so we don't excessively rehash
+        g_pserver->asyncworkqueue->AddWorkFunction([dT]{
+            dictRelease(dT);
+        }, false);
+    } else {
+        dictEmpty(m_pdict, nullptr);
+    }
+}
+
+void redisDbPersistentData::disableKeyCache()
+{
+    if (m_spstorage == nullptr)
+        return;
+    m_spstorage->emergencyFreeCache();
+}
+
+bool redisDbPersistentData::keycacheIsEnabled()
+{
+    if (m_spstorage == nullptr)
+        return false;
+    return m_spstorage->keycacheIsEnabled();
+}
+
+void redisDbPersistentData::trackkey(const char *key, bool fUpdate)
+{
+    if (m_fTrackingChanges && !m_fAllChanged && m_spstorage) {
+        dictEntry *de = dictFind(m_dictChanged, key);
+        if (de == nullptr) {
+            dictAdd(m_dictChanged, (void*)sdsdupshared(key), (void*)fUpdate);
+            if (!fUpdate)
+                ++m_cnewKeysPending;
+        }
+    }
+}
+
+sds serializeExpire(const expireEntry *pexpire)
+{
+    sds str = sdsnewlen(nullptr, sizeof(unsigned));
+
+    if (pexpire == nullptr)
+    {
+        unsigned zero = 0;
+        memcpy(str, &zero, sizeof(unsigned));
+        return str;
+    }
+
+    auto &e = *pexpire;
+    unsigned celem = (unsigned)e.size();
+    memcpy(str, &celem, sizeof(unsigned));
+    
+    for (auto itr = e.begin(); itr != e.end(); ++itr)
+    {
+        unsigned subkeylen = itr.subkey() ? (unsigned)sdslen(itr.subkey()) : 0;
+        size_t strOffset = sdslen(str);
+        str = sdsgrowzero(str, sdslen(str) + sizeof(unsigned) + subkeylen + sizeof(long long));
+        memcpy(str + strOffset, &subkeylen, sizeof(unsigned));
+        if (itr.subkey())
+            memcpy(str + strOffset + sizeof(unsigned), itr.subkey(), subkeylen);
+        long long when = itr.when();
+        memcpy(str + strOffset + sizeof(unsigned) + subkeylen, &when, sizeof(when));
+    }
+    return str;
+}
+
+std::unique_ptr<expireEntry> deserializeExpire(sds key, const char *str, size_t cch, size_t *poffset)
+{
+    unsigned celem;
+    if (cch < sizeof(unsigned))
+        throw "Corrupt expire entry";
+    memcpy(&celem, str, sizeof(unsigned));
+    std::unique_ptr<expireEntry> spexpire;
+
+    size_t offset = sizeof(unsigned);
+    for (; celem > 0; --celem)
+    {
+        serverAssert(cch > (offset+sizeof(unsigned)));
+        
+        unsigned subkeylen;
+        memcpy(&subkeylen, str + offset, sizeof(unsigned));
+        offset += sizeof(unsigned);
+
+        sds subkey = nullptr;
+        if (subkeylen != 0)
+        {
+            serverAssert(cch > (offset + subkeylen));
+            subkey = sdsnewlen(nullptr, subkeylen);
+            memcpy(subkey, str + offset, subkeylen);
+            offset += subkeylen;
+        }
+        
+        long long when;
+        serverAssert(cch >= (offset + sizeof(long long)));
+        memcpy(&when, str + offset, sizeof(long long));
+        offset += sizeof(long long);
+
+        if (spexpire == nullptr)
+            spexpire = std::make_unique<expireEntry>(key, subkey, when);
+        else
+            spexpire->update(subkey, when);
+
+        if (subkey)
+            sdsfree(subkey);
+    }
+
+    *poffset = offset;
+    return spexpire;
+}
+
+sds serializeStoredObjectAndExpire(redisDbPersistentData *db, const char *key, robj_roptr o)
+{
+    auto itrExpire = db->setexpire()->find(key);
+    const expireEntry *pexpire = nullptr;
+    if (itrExpire != db->setexpire()->end())
+        pexpire = &(*itrExpire);
+
+    sds str = serializeExpire(pexpire);
+    str = serializeStoredObject(o, str);
+    return str;
+}
+
+int dbnumFromDb(redisDb *db)
+{
+    for (int i = 0; i < cserver.dbnum; ++i)
+    {
+        if (g_pserver->db[i] == db)
+            return i;
+    }
+    serverPanic("invalid database pointer");
+}
+
+bool redisDbPersistentData::prefetchKeysAsync(client *c, parsed_command &command, bool fExecOK)
+{
+    if (m_spstorage == nullptr) {
+#if defined(__x86_64__) || defined(__i386__)
+        // We do a quick 'n dirty check for set & get.  Anything else is too slow.
+        //  Should the user do something weird like remap them then the worst that will
+        //  happen is we don't prefetch or we prefetch wrong data.  A mild perf hit, but
+        //  not dangerous
+        if (command.argc >= 2) {
+            const char *cmd = szFromObj(command.argv[0]);
+            if (!strcasecmp(cmd, "set") || !strcasecmp(cmd, "get")) {
+                if (c->db->m_spdbSnapshotHOLDER != nullptr)
+                    return false; // this is dangerous enough without a snapshot around
+                auto h = dictSdsHash(szFromObj(command.argv[1]));
+                for (int iht = 0; iht < 2; ++iht) {
+                    auto hT = h & c->db->m_pdict->ht[iht].sizemask;
+                    dictEntry **table;
+                    __atomic_load(&c->db->m_pdict->ht[iht].table, &table, __ATOMIC_RELAXED);
+                    if (table != nullptr) {
+                        dictEntry *de;
+                        __atomic_load(&table[hT], &de, __ATOMIC_ACQUIRE);
+                        while (de != nullptr) {
+                            _mm_prefetch(dictGetKey(de), _MM_HINT_T2);
+                            __atomic_load(&de->next, &de, __ATOMIC_ACQUIRE);
+                        }
+                    }
+                    if (!dictIsRehashing(c->db->m_pdict))
+                        break;
+                }
+            }
+        }
+#endif
+        return false;
+    }
+
+    AeLocker lock;
+
+    std::vector<robj*> veckeys;
+    lock.arm(c);
+    getKeysResult result = GETKEYS_RESULT_INIT;
+    auto cmd = lookupCommand(szFromObj(command.argv[0]));
+    if (cmd == nullptr)
+        return false; // Bad command? It's not for us to judge, just bail
+    
+    if (command.argc < std::abs(cmd->arity))
+        return false; // Invalid number of args
+    
+    int numkeys = getKeysFromCommand(cmd, command.argv, command.argc, &result);
+    for (int ikey = 0; ikey < numkeys; ++ikey)
+    {
+        robj *objKey = command.argv[result.keys[ikey]];
+        if (this->find_cached_threadsafe(szFromObj(objKey)) == nullptr)
+            veckeys.push_back(objKey);
+    }
+    lock.disarm();
+
+    getKeysFreeResult(&result);
+
+    std::vector<std::tuple<sds, robj*, std::unique_ptr<expireEntry>>> vecInserts;
+    for (robj *objKey : veckeys)
+    {
+        sds sharedKey = sdsdupshared((sds)szFromObj(objKey));
+        std::unique_ptr<expireEntry> spexpire;
+        robj *o = nullptr;
+        m_spstorage->retrieve((sds)szFromObj(objKey), [&](const char *, size_t, const void *data, size_t cb){
+                size_t offset = 0;
+                spexpire = deserializeExpire(sharedKey, (const char*)data, cb, &offset);    
+                o = deserializeStoredObject(this, sharedKey, reinterpret_cast<const char*>(data) + offset, cb - offset);
+                serverAssert(o != nullptr);
+        });
+
+        if (o != nullptr) {
+            vecInserts.emplace_back(sharedKey, o, std::move(spexpire));
+        } else if (sharedKey != nullptr) {
+            sdsfree(sharedKey);
+        }
+    }
+
+    bool fNoInsert = false;
+    if (!vecInserts.empty()) {
+        lock.arm(c);
+        for (auto &tuple : vecInserts)
+        {
+            sds sharedKey = std::get<0>(tuple);
+            robj *o = std::get<1>(tuple);
+            std::unique_ptr<expireEntry> spexpire = std::move(std::get<2>(tuple));
+
+            if (o != nullptr)
+            {
+                if (this->find_cached_threadsafe(sharedKey) != nullptr)
+                {
+                    // While unlocked this was already ensured
+                    decrRefCount(o);
+                    sdsfree(sharedKey);
+                    fNoInsert = true;
+                }
+                else
+                {
+                    if (spexpire != nullptr) {
+                        if (spexpire->when() < mstime()) {
+                            fNoInsert = true;
+                            break;
+                        }
+                    }
+                    dictAdd(m_pdict, sharedKey, o);
+                    o->SetFExpires(spexpire != nullptr);
+
+                    if (spexpire != nullptr)
+                    {
+                        auto itr = m_setexpire->find(sharedKey);
+                        if (itr != m_setexpire->end())
+                            m_setexpire->erase(itr);
+                        m_setexpire->insert(std::move(*spexpire));
+                        serverAssert(m_setexpire->find(sharedKey) != m_setexpire->end());
+                    }
+                    serverAssert(o->FExpires() == (m_setexpire->find(sharedKey) != m_setexpire->end()));
+                }
+            }
+            else
+            {
+                if (sharedKey != nullptr)
+                    sdsfree(sharedKey); // BUG but don't bother crashing
+            }
+        }
+        lock.disarm();
+    }
+
+    if (fExecOK && !fNoInsert && cmd->proc == getCommand && !vecInserts.empty()) {
+        robj *o = std::get<1>(vecInserts[0]);
+        if (o != nullptr) {
+            addReplyBulk(c, o);
+            return true;
+        }
+    }
+    return false;
 }

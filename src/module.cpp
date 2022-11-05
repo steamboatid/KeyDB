@@ -835,6 +835,7 @@ int64_t commandFlagsFromString(char *s) {
         else if (!strcasecmp(t,"may-replicate")) flags |= CMD_MAY_REPLICATE;
         else if (!strcasecmp(t,"getkeys-api")) flags |= CMD_MODULE_GETKEYS;
         else if (!strcasecmp(t,"no-cluster")) flags |= CMD_MODULE_NO_CLUSTER;
+        else if (!strcasecmp(t,"async")) flags |= CMD_ASYNC_OK;
         else break;
     }
     sdsfreesplitres(tokens,count);
@@ -2441,7 +2442,8 @@ int RM_UnlinkKey(RedisModuleKey *key) {
  * If no TTL is associated with the key or if the key is empty,
  * REDISMODULE_NO_EXPIRE is returned. */
 mstime_t RM_GetExpire(RedisModuleKey *key) {
-    expireEntry *pexpire = getExpire(key->db,key->key);
+    std::unique_lock<fastlock> ul(g_expireLock);
+    expireEntry *pexpire = key->db->getExpire(key->key);
     mstime_t expire = INVALID_EXPIRE;
     if (pexpire != nullptr)
         pexpire->FGetPrimaryExpire(&expire);
@@ -2477,7 +2479,7 @@ int RM_SetExpire(RedisModuleKey *key, mstime_t expire) {
  * If no TTL is associated with the key or if the key is empty,
  * REDISMODULE_NO_EXPIRE is returned. */
 mstime_t RM_GetAbsExpire(RedisModuleKey *key) {
-    auto expire = getExpire(key->db,key->key);
+    auto expire = key->db->getExpire(key->key);
     if (expire == nullptr || key->value == NULL) 
         return REDISMODULE_NO_EXPIRE;
     return expire->when();
@@ -2515,7 +2517,7 @@ void RM_ResetDataset(int restart_aof, int async) {
 
 /* Returns the number of keys in the current db. */
 unsigned long long RM_DbSize(RedisModuleCtx *ctx) {
-    return dictSize(ctx->client->db->dict);
+    return ctx->client->db->size();
 }
 
 /* Returns a name of a random key, or NULL if current db is empty. */
@@ -4287,10 +4289,9 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     }
 
     {
-    aeAcquireLock();
+    AeLocker locker; locker.arm(nullptr);
     std::unique_lock<fastlock> ul(c->lock);
     call(c,call_flags);
-    aeReleaseLock();
     }
 
     g_pserver->replication_allowed = prev_replication_allowed;
@@ -7880,7 +7881,7 @@ int RM_Scan(RedisModuleCtx *ctx, RedisModuleScanCursor *cursor, RedisModuleScanC
     }
     int ret = 1;
     ScanCBData data = { ctx, privdata, fn };
-    cursor->cursor = dictScan(ctx->client->db->dict, cursor->cursor, moduleScanCallback, NULL, &data);
+    cursor->cursor = dictScan(ctx->client->db->dictUnsafeKeyOnly(), cursor->cursor, moduleScanCallback, NULL, &data);
     if (cursor->cursor == 0) {
         cursor->done = 1;
         ret = 0;
@@ -8459,6 +8460,8 @@ void moduleFireServerEvent(uint64_t eid, int subid, void *data) {
      * cheap if there are no registered modules. */
     if (listLength(RedisModule_EventListeners) == 0) return;
 
+    aeAcquireLock();
+
     int real_client_used = 0;
     listIter li;
     listNode *ln;
@@ -8534,6 +8537,8 @@ void moduleFireServerEvent(uint64_t eid, int subid, void *data) {
             moduleFreeContext(&ctx);
         }
     }
+
+    aeReleaseLock();
 }
 
 /* Remove all the listeners for this module: this is used before unloading

@@ -47,6 +47,7 @@ set ::all_tests {
     integration/replication-3
     integration/replication-4
     integration/replication-psync
+    integration/replication-psync-flash
     integration/replication-active
     integration/replication-multimaster
     integration/replication-multimaster-connect
@@ -59,10 +60,13 @@ set ::all_tests {
     integration/failover
     integration/keydb-cli
     integration/keydb-benchmark
+    integration/replication-fast
+    integration/replication-psync-multimaster
     unit/pubsub
     unit/slowlog
     unit/scripting
     unit/maxmemory
+    unit/flash
     unit/introspection
     unit/introspection-2
     unit/limits
@@ -76,6 +80,7 @@ set ::all_tests {
     unit/wait
     unit/pendingquerybuf
     unit/tls
+    unit/tls-name-validation
     unit/tracking
     unit/oom-score-adj
     unit/shutdown
@@ -84,6 +89,7 @@ set ::all_tests {
     integration/logging
     integration/corrupt-dump
     integration/corrupt-dump-fuzzer
+    unit/soft_shutdown
 }
 # Index to the next test to run in the ::all_tests list.
 set ::next_test 0
@@ -239,6 +245,26 @@ proc redis_client {args} {
     return $client
 }
 
+proc redis_client_tls {args} {
+    set level 0
+    if {[llength $args] > 0 && [string is integer [lindex $args 0]]} {
+        set level [lindex $args 0]
+        set args [lrange $args 1 end]
+    }
+
+    set tlsoptions ""
+    if {[llength $args] > 0 && ![string is integer [lindex $args 0]]} {
+        set tlsoptions [lrange $args 0 end]
+    }
+
+    # create client that takes in custom tls options
+    set client [redis [srv $level "host"] [srv $level "port"] 0 $::tls $tlsoptions]
+
+    # # select the right db and read the response (OK)
+    $client select 9
+    return $client
+}
+
 # Provide easy access to INFO properties. Same semantic as "proc r".
 proc s {args} {
     set level 0
@@ -270,6 +296,7 @@ proc cleanup {} {
     flush stdout
     catch {exec rm -rf {*}[glob tests/tmp/redis.conf.*]}
     catch {exec rm -rf {*}[glob tests/tmp/server.*]}
+    catch {exec rm -rf {*}[glob tests/tmp/tlscerts.*]}
     if {!$::quiet} {puts "OK"}
 }
 
@@ -691,10 +718,35 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
     } elseif {$opt eq {--help}} {
         print_help_screen
         exit 0
+    } elseif {$opt eq {--flash}} {
+        lappend ::global_storage_provider storage-provider
+        lappend ::global_storage_provider flash
+        lappend ::global_storage_provider ./rocks.db
+        set ::all_tests {
+            integration/replication
+            integration/replication-2
+            integration/replication-3
+            integration/replication-4
+            integration/replication-psync
+        }
+        set fp [open {./tests/integration/rdb-repl-tests} r]
+        set file_data [read $fp]
+        close $fp
+        set ::skiptests [split $file_data "\n"]
     } else {
         puts "Wrong argument: $opt"
         exit 1
     }
+}
+
+# Check if we compiled with flash
+set status [catch {exec src/keydb-server --is-flash-enabled}]
+if {$status == 0} {
+    puts "KeyDB was built with FLASH, including FLASH tests"
+    set ::flash_enabled 1
+} else {
+    puts "KeyDB was not built with FLASH.  Excluding FLASH tests"
+    set ::flash_enabled 0
 }
 
 set filtered_tests {}

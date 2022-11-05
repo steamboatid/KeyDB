@@ -21,7 +21,6 @@ public:
 
         if (c != nullptr)
         {
-            serverAssert(!m_fArmed);
             serverAssert(c->lock.fOwnLock());
 
             if (!aeTryAcquireLock(true /*fWeak*/))    // avoid locking the client if we can

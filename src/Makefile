@@ -12,6 +12,10 @@
 # Dependencies are stored in the Makefile.dep file. To rebuild this file
 # Just use 'make dep', but this is only needed by developers.
 
+# we ship KeyDB with TLS by default
+# export it here as both this file and deps/Makefile uses it
+export BUILD_TLS ?= yes
+
 release_hdr := $(shell sh -c './mkreleasehdr.sh')
 uname_S := $(shell sh -c 'uname -s 2>/dev/null || echo not')
 uname_M := $(shell sh -c 'uname -m 2>/dev/null || echo not')
@@ -59,6 +63,7 @@ endif
 endif
 
 USEASM?=true
+ENABLE_FLASH?=no
 
 ifneq ($(strip $(SANITIZE)),)
 	CFLAGS+= -fsanitize=$(SANITIZE) -DSANITIZE  -fno-omit-frame-pointer
@@ -66,6 +71,19 @@ ifneq ($(strip $(SANITIZE)),)
 	LDFLAGS+= -fsanitize=$(SANITIZE)
 	MALLOC=libc
 	USEASM=false
+endif
+
+ifeq ($(ENABLE_FLASH),yes)
+	FINAL_LIBS+= -lz -lcrypto -lbz2 -lzstd -llz4 -lsnappy
+	CXXFLAGS+= -I../deps/rocksdb/include/ -DENABLE_ROCKSDB
+	STORAGE_OBJ+= storage/rocksdb.o storage/rocksdbfactory.o
+	FINAL_LIBS+= ../deps/rocksdb/librocksdb.a 
+	DEPENDENCY_TARGETS+= rocksdb
+endif
+
+
+ifeq ($(CHECKED),true)
+	CXXFLAGS+= -DCHECKED_BUILD
 endif
 
 # Do we use our assembly spinlock? X64 only
@@ -114,14 +132,19 @@ ifeq ($(USE_JEMALLOC),no)
 	MALLOC=libc
 endif
 
+
+ifeq ($(NO_LICENSE_CHECK),yes)
+	CXXFLAGS+=-DNO_LICENSE_CHECK=1
+endif	
+
 # Override default settings if possible
 -include .make-settings
 
+DEBUG=-g -ggdb
 FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(KEYDB_CFLAGS) $(REDIS_CFLAGS)
 FINAL_CXXFLAGS=$(CXX_STD) $(WARN) $(OPT) $(DEBUG) $(CXXFLAGS) $(KEYDB_CFLAGS) $(REDIS_CFLAGS)
 FINAL_LDFLAGS=$(LDFLAGS) $(KEYDB_LDFLAGS) $(DEBUG)
 FINAL_LIBS+=-lm
-DEBUG=-g -ggdb
 
 ifneq ($(uname_S),Darwin)
 	FINAL_LIBS+=-latomic
@@ -231,6 +254,7 @@ endif
 
 ifdef OPENSSL_PREFIX
 	OPENSSL_CFLAGS=-I$(OPENSSL_PREFIX)/include
+	OPENSSL_CXXFLAGS=-I$(OPENSSL_PREFIX)/include
 	OPENSSL_LDFLAGS=-L$(OPENSSL_PREFIX)/lib
 	# Also export OPENSSL_PREFIX so it ends up in deps sub-Makefiles
 	export OPENSSL_PREFIX
@@ -238,7 +262,7 @@ endif
 
 # Include paths to dependencies
 FINAL_CFLAGS+= -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src -I../deps/hdr_histogram
-FINAL_CXXFLAGS+= -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src -I../deps/hdr_histogram
+FINAL_CXXFLAGS+= -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src -I../deps/hdr_histogram -I../deps/concurrentqueue
 
 # Determine systemd support and/or build preference (defaulting to auto-detection)
 BUILD_WITH_SYSTEMD=no
@@ -347,15 +371,17 @@ ENDCOLOR="\033[0m"
 
 ifndef V
 QUIET_CC = @printf '    %b %b\n' $(CCCOLOR)CC$(ENDCOLOR) $(SRCCOLOR)$@$(ENDCOLOR);
+QUIET_CP = @printf '    %b %b\n' $(CCCOLOR)COPY$(ENDCOLOR) $(SRCCOLOR)$@$(ENDCOLOR);
 QUIET_LINK = @printf '    %b %b\n' $(LINKCOLOR)LINK$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR);
 QUIET_INSTALL = @printf '    %b %b\n' $(LINKCOLOR)INSTALL$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR);
 endif
 
 REDIS_SERVER_NAME=keydb-server$(PROG_SUFFIX)
 REDIS_SENTINEL_NAME=keydb-sentinel$(PROG_SUFFIX)
-REDIS_SERVER_OBJ=adlist.o quicklist.o ae.o anet.o dict.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o t_nhash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o crc16.o endianconv.o slowlog.o scripting.o bio.o rio.o rand.o memtest.o crcspeed.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o acl.o storage.o rdb-s3.o fastlock.o new.o tracking.o cron.o connection.o tls.o sha256.o motd.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o $(ASM_OBJ)
+REDIS_SERVER_OBJ=adlist.o quicklist.o ae.o anet.o dict.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o t_nhash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o crc16.o endianconv.o slowlog.o scripting.o bio.o rio.o rand.o memtest.o crcspeed.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o acl.o storage.o rdb-s3.o fastlock.o new.o tracking.o cron.o connection.o tls.o sha256.o motd_server.o timeout.o setcpuaffinity.o AsyncWorkQueue.o snapshot.o storage/teststorageprovider.o keydbutils.o StorageCache.o monotonic.o cli_common.o mt19937-64.o $(ASM_OBJ) $(STORAGE_OBJ)
+KEYDB_SERVER_OBJ=SnapshotPayloadParseState.o
 REDIS_CLI_NAME=keydb-cli$(PROG_SUFFIX)
-REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o redis-cli-cpphelper.o zmalloc.o release.o anet.o ae.o crcspeed.o crc64.o siphash.o crc16.o storage-lite.o fastlock.o new.o motd.o monotonic.o cli_common.o mt19937-64.o $(ASM_OBJ)
+REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o redis-cli-cpphelper.o zmalloc.o release.o anet.o ae.o crcspeed.o crc64.o siphash.o crc16.o storage-lite.o fastlock.o motd_client.o monotonic.o cli_common.o mt19937-64.o $(ASM_OBJ)
 REDIS_BENCHMARK_NAME=keydb-benchmark$(PROG_SUFFIX)
 REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o dict.o zmalloc.o release.o crcspeed.o crc64.o siphash.o redis-benchmark.o storage-lite.o fastlock.o new.o monotonic.o cli_common.o mt19937-64.o $(ASM_OBJ)
 REDIS_CHECK_RDB_NAME=keydb-check-rdb$(PROG_SUFFIX)
@@ -412,7 +438,7 @@ endif
 	@touch $@
 
 # keydb-server
-$(REDIS_SERVER_NAME): $(REDIS_SERVER_OBJ)
+$(REDIS_SERVER_NAME): $(REDIS_SERVER_OBJ) $(KEYDB_SERVER_OBJ)
 	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/lua/src/liblua.a $(FINAL_LIBS)
 
 # keydb-sentinel
@@ -439,12 +465,18 @@ $(REDIS_BENCHMARK_NAME): $(REDIS_BENCHMARK_OBJ)
 $(KEYDB_DIAGNOSTIC_NAME): $(KEYDB_DIAGNOSTIC_OBJ)
 	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a $(FINAL_LIBS)
 
-DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ:%.o=%.d)
+DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(KEYDB_SERVER_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ:%.o=%.d)
 -include $(DEP)
 
 # Because the jemalloc.h header is generated as a part of the jemalloc build,
 # building it should complete before building any other object. Instead of
 # depending on a single artifact, build all dependencies first.
+motd_client.o: motd.cpp .make-prerequisites
+	$(REDIS_CXX) -MMD -o motd_client.o -c $< -DCLIENT -fno-lto
+
+motd_server.o: motd.cpp .make-prerequisites
+	$(REDIS_CXX) -MMD -o motd_server.o -c $< -DSERVER
+
 %.o: %.c .make-prerequisites
 	$(REDIS_CC) -MMD -o $@ -c $<
 
@@ -456,6 +488,8 @@ DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ
 
 clean:
 	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) $(KEYDB_DIAGNOSTIC_NAME) *.o *.gcda *.gcno *.gcov KeyDB.info lcov-html Makefile.dep
+	rm -rf storage/*.o
+	rm -rf keydb-server
 	rm -f $(DEP)
 	rm -f *.d
 

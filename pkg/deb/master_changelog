@@ -1,3 +1,35 @@
+keydb (6:6.3.1-1distribution_placeholder) codename_placeholder; urgency=medium
+
+  * This point release contains fixes to bugs related to expires, active-rep, and rdb saving
+  * Issues fixed: #419, #422, #428
+  * PRs: #426, #429, #431, #433
+
+-- Ben Schermel <ben@eqalpha.com>  Mon, 23 May 2022 20:00:37 +0000
+
+keydb (6:6.3.0-1distribution_placeholder) codename_placeholder; urgency=medium
+
+  * This release open sources KeyDB Enterprise features into the open source project along with PSYNC for active replication
+  * Partial synchronization for active replication is introduced
+  * MVCC introduced into codebase from KeyDB Enterprise
+  * Async commands added: GET, MGET. These will see perf improvements
+  * KEYS and SCAN commands will no longer be blocking calls
+  * Async Rehash implemented for additional stability to perf
+  * IStorage interface added
+  * In-process background saving (forkless) to comply with maxmemory setting
+  * See v6.3.0 tagged release notes on github for a detailed explanation of these changes
+
+-- Ben Schermel <ben@eqalpha.com>  Wed, 11 May 2022 20:00:37 +0000
+
+keydb (6:6.2.2-1distribution_placeholder) codename_placeholder; urgency=medium
+
+  * Acquire lock in module.cpp to fix module test break
+  * Fix usage of nanosleep() on Apple hardware
+  * Fix networking deadlock (#183)
+  * Remove redundant zfree() in keydb-benchmark
+  * Issues resolved: #378, #384
+
+-- Ben Schermel <ben@eqalpha.com>  Sat, 15 Jan 2022 20:00:37 +0000
+
 keydb (6:6.2.1-1distribution_placeholder) codename_placeholder; urgency=medium
 
   * This release of KeyDB is at parity with Redis 6.2.6. In addition, the following changes were included:
@@ -67,7 +99,7 @@ keydb (6:6.0.8-1distribution_placeholder) codename_placeholder; urgency=medium
 
   * This is our first release to fully support all Redis 6.0.4 features, including but not limited to: TLS Support (fully supports multithreading!), Client side caching, RESP 3 Support
   * KeyDB Has also added the following new features: Improved memory efficiency for short strings, Fastlock autotuning, KeyDB.HRENAME (rename a member of a hash)In addition we've spent a lot of time focussing on stability.
-  * The following bug fixes are resolved: 150 - Deadlock in ReplicationFeedMonitors, 170 - KeyDB dying via SIGABORT, 180 - crash after setting maxclients via cmd line, 169 - Write performance of a master dropped sharply when a slave is added
+  * The following bug fixes are resolved: 150 - Deadlock in ReplicationFeedMonitors, 170 - KeyDB dying via SIGABORT, 180 - crash after setting maxclients via cmd line, 169 - Write performance of a master dropped sharply when a replica is added
   * In addition untracked issues were resolved: Potential deadlock when entering futex sleep, Pub/Sub Async messages may not be sent in a timely manner when load is low, Excessive logging during failed RREPLAY, KeyDB unresponsive handling clients on different threads during RDB load
   * Updated deb package builds to build from source and phasing out init.d. dh_installsystemd from deb helper 11 used where applicable
   * Naming conventions are now updated [ keydbpackage_version-build~distribution_architecture] and master changelog included and maintained

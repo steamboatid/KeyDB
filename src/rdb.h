@@ -119,10 +119,11 @@
 #define RDB_MODULE_OPCODE_STRING 5  /* String. */
 
 /* rdbLoad...() functions flags. */
-#define RDB_LOAD_NONE   0
-#define RDB_LOAD_ENC    (1<<0)
-#define RDB_LOAD_PLAIN  (1<<1)
-#define RDB_LOAD_SDS    (1<<2)
+#define RDB_LOAD_NONE       0
+#define RDB_LOAD_ENC        (1<<0)
+#define RDB_LOAD_PLAIN      (1<<1)
+#define RDB_LOAD_SDS        (1<<2)
+#define RDB_LOAD_SDS_SHARED ((1 << 3) | RDB_LOAD_SDS)
 
 /* flags on the purpose of rdb save or load */
 #define RDBFLAGS_NONE 0                 /* No special RDB loading. */
@@ -151,15 +152,15 @@ int rdbLoadFile(const char *filename, rdbSaveInfo *rsi, int rdbflags);
 int rdbSaveBackground(rdbSaveInfo *rsi);
 int rdbSaveToSlavesSockets(rdbSaveInfo *rsi);
 void rdbRemoveTempFile(pid_t childpid, int from_signal);
-int rdbSave(rdbSaveInfo *rsi);
-int rdbSaveFile(char *filename, rdbSaveInfo *rsi);
-int rdbSaveFp(FILE *pf, rdbSaveInfo *rsi);
-int rdbSaveS3(char *path, rdbSaveInfo *rsi);
+int rdbSave(const redisDbPersistentDataSnapshot **rgpdb, rdbSaveInfo *rsi);
+int rdbSaveFile(char *filename, const redisDbPersistentDataSnapshot **rgpdb, rdbSaveInfo *rsi);
+int rdbSaveFp(FILE *pf, const redisDbPersistentDataSnapshot **rgpdb, rdbSaveInfo *rsi);
+int rdbSaveS3(char *path, const redisDbPersistentDataSnapshot **rgpdb, rdbSaveInfo *rsi);
 int rdbLoadS3(char *path, rdbSaveInfo *rsi, int rdbflags);
-ssize_t rdbSaveObject(rio *rdb, robj_roptr o, robj *key);
+ssize_t rdbSaveObject(rio *rdb, robj_roptr o, robj_roptr key);
 size_t rdbSavedObjectLen(robj *o, robj *key);
 robj *rdbLoadObject(int type, rio *rdb, sds key, int *error, uint64_t mvcc_tstamp);
-void backgroundSaveDoneHandler(int exitcode, int bysignal);
+void backgroundSaveDoneHandler(int exitcode, bool fCancelled);
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime);
 ssize_t rdbSaveSingleModuleAux(rio *rdb, int when, moduleType *mt);
 robj *rdbLoadCheckModuleValue(rio *rdb, char *modulename);
@@ -172,7 +173,7 @@ int rdbLoadBinaryDoubleValue(rio *rdb, double *val);
 int rdbSaveBinaryFloatValue(rio *rdb, float val);
 int rdbLoadBinaryFloatValue(rio *rdb, float *val);
 int rdbLoadRio(rio *rdb, int rdbflags, rdbSaveInfo *rsi);
-int rdbSaveRio(rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi);
+int rdbSaveRio(rio *rdb, const redisDbPersistentDataSnapshot **rgpdb, int *error, int flags, rdbSaveInfo *rsi);
 rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi);
 
 #endif

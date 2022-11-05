@@ -29,10 +29,15 @@
  */
 
 #include "server.h"
+#include "storage/rocksdbfactory.h"
+#include "storage/teststorageprovider.h"
 #include "cluster.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/sysinfo.h>
+#endif
 
 const char *KEYDB_SET_VERSION = KEYDB_REAL_VERSION;
 
@@ -98,6 +103,11 @@ configEnum repl_diskless_load_enum[] = {
     {"on-empty-db", REPL_DISKLESS_LOAD_WHEN_DB_EMPTY},
     {"swapdb", REPL_DISKLESS_LOAD_SWAPDB},
     {NULL, 0}
+};
+
+configEnum storage_memory_model_enum[] = {
+    {"writeback", STORAGE_WRITEBACK},
+    {"writethrough", STORAGE_WRITETHROUGH},
 };
 
 configEnum tls_auth_clients_enum[] = {
@@ -333,6 +343,72 @@ void queueLoadModule(sds path, sds *argv, int argc) {
     listAddNodeTail(g_pserver->loadmodule_queue,loadmod);
 }
 
+sds g_sdsProvider = nullptr;
+sds g_sdsArgs = nullptr;
+
+bool initializeStorageProvider(const char **err)
+{
+    try
+    {
+        bool fTest = false;
+        if (g_sdsProvider == nullptr)
+            return true;
+        if (!strcasecmp(g_sdsProvider, "flash") && g_sdsArgs != nullptr)
+        {
+#ifdef ENABLE_ROCKSDB
+            // Create The Storage Factory (if necessary)
+            serverLog(LL_NOTICE, "Initializing FLASH storage provider (this may take a long time)");
+            adjustOpenFilesLimit();
+            g_pserver->m_pstorageFactory = CreateRocksDBStorageFactory(g_sdsArgs, cserver.dbnum, cserver.storage_conf, cserver.storage_conf ? strlen(cserver.storage_conf) : 0);
+#else
+	    serverLog(LL_WARNING, "To use the flash storage provider please compile KeyDB with ENABLE_FLASH=yes");
+	    serverLog(LL_WARNING, "Exiting due to the use of an unsupported storage provider");
+	    exit(EXIT_FAILURE);
+#endif
+	}
+        else if (!strcasecmp(g_sdsProvider, "test") && g_sdsArgs == nullptr)
+        {
+            g_pserver->m_pstorageFactory = new (MALLOC_LOCAL) TestStorageFactory();
+            fTest = true;
+        }
+
+        if (g_pserver->m_pstorageFactory != nullptr && !fTest)
+        {
+            // We need to set max memory to a sane default so keys are actually evicted properly
+            if (g_pserver->maxmemory == 0 && g_pserver->maxmemory_policy == MAXMEMORY_NO_EVICTION)
+            {
+#ifdef __linux__
+                struct sysinfo sys;
+                if (sysinfo(&sys) == 0)
+                {
+                    // By default it's a little under half the memory.  This gives sufficient room for background saving
+                    g_pserver->maxmemory = static_cast<unsigned long long>(sys.totalram / 2.2);
+                    g_pserver->maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
+                }
+#else
+                serverLog(LL_WARNING, "Unable to dynamically set maxmemory, please set maxmemory and maxmemory-policy if you are using a storage provier");
+#endif
+            }
+            else if (g_pserver->maxmemory_policy == MAXMEMORY_NO_EVICTION)
+            {
+                g_pserver->maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
+            }
+        }
+        else
+        {
+            *err = "Unknown storage provider";
+        }
+        return g_pserver->m_pstorageFactory != nullptr;
+    }
+    catch(std::string str)
+    {
+        serverLog(LL_WARNING, "ERROR: Failed to initialize %s storage provider. Details to follow below.", g_sdsProvider);
+        serverLog(LL_WARNING, "\t%s", str.c_str());
+        serverLog(LL_WARNING, "KeyDB cannot start. Exiting.");
+        exit(EXIT_FAILURE);
+    }
+}
+
 /* Parse an array of CONFIG_OOM_COUNT sds strings, validate and populate
  * g_pserver->oom_score_adj_values if valid.
  */
@@ -506,7 +582,7 @@ void loadServerConfigFromString(char *config) {
             if (g_pserver->logfile[0] != '\0') {
                 /* Test if we are able to open the file. The server will not
                  * be able to abort just for this problem later... */
-                logfp = fopen(g_pserver->logfile,"a+");
+                logfp = fopen(g_pserver->logfile,"a+");/*//dkmods*/
                 if (logfp == NULL) {
                     err = sdscatprintf(sdsempty(),
                         "Can't open the log file: %s", strerror(errno));
@@ -671,6 +747,15 @@ void loadServerConfigFromString(char *config) {
                 g_pserver->fActiveReplica = CONFIG_DEFAULT_ACTIVE_REPLICA;
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
             }
+        } else if (!strcasecmp(argv[0], "tls-allowlist")) {
+            if (argc < 2) {
+                err = "must supply at least one element in the allow list"; goto loaderr;
+            }
+            if (!g_pserver->tls_allowlist.empty()) {
+                err = "tls-allowlist may only be set once"; goto loaderr;
+            }
+            for (int i = 1; i < argc; i++)
+                g_pserver->tls_allowlist.emplace(argv[i], strlen(argv[i]));
         } else if (!strcasecmp(argv[0], "version-override") && argc == 2) {
             KEYDB_SET_VERSION = zstrdup(argv[1]);
             serverLog(LL_WARNING, "Warning version is overriden to: %s\n", KEYDB_SET_VERSION);
@@ -678,9 +763,16 @@ void loadServerConfigFromString(char *config) {
             g_fTestMode = yesnotoi(argv[1]);
         } else if (!strcasecmp(argv[0],"rdbfuzz-mode")) {
             // NOP, handled in main
-        } else if (!strcasecmp(argv[0],"enable-pro")) {
-            cserver.fUsePro = true;
-            break;
+        } else if (!strcasecmp(argv[0],"storage-provider") && argc >= 2) {
+            g_sdsProvider = sdsdup(argv[1]);
+            if (argc > 2)
+                g_sdsArgs = sdsdup(argv[2]);
+        } else if (!strcasecmp(argv[0],"is-flash-enabled") && argc == 1) {
+#ifdef ENABLE_ROCKSDB
+            exit(EXIT_SUCCESS);
+#else
+            exit(EXIT_FAILURE);
+#endif
         } else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }
@@ -790,8 +882,18 @@ void configSetCommand(client *c) {
     int err;
     const char *errstr = NULL;
     serverAssertWithInfo(c,c->argv[2],sdsEncodedObject(c->argv[2]));
-    serverAssertWithInfo(c,c->argv[3],sdsEncodedObject(c->argv[3]));
-    o = c->argv[3];
+
+    if (c->argc < 4 || c->argc > 4) {
+        o = nullptr;
+        // Variadic set is only supported for tls-allowlist
+        if (strcasecmp(szFromObj(c->argv[2]), "tls-allowlist")) {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
+    } else {
+        o = c->argv[3];
+        serverAssertWithInfo(c,c->argv[3],sdsEncodedObject(c->argv[3]));
+    }
 
     /* Iterate the configs that are standard */
     for (standardConfig *config = configs; config->name != NULL; config++) {
@@ -953,6 +1055,12 @@ void configSetCommand(client *c) {
             enableWatchdog(ll);
         else
             disableWatchdog();
+    } config_set_special_field("tls-allowlist") {
+        g_pserver->tls_allowlist.clear();
+        for (int i = 3; i < c->argc; ++i) {
+            robj *val = c->argv[i];
+            g_pserver->tls_allowlist.emplace(szFromObj(val), sdslen(szFromObj(val)));
+        }
     /* Everything else is an error... */
     } config_set_else {
         addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
@@ -1154,6 +1262,14 @@ void configGetCommand(client *c) {
     if (stringmatch(pattern,"active-replica",1)) {
         addReplyBulkCString(c,"active-replica");
         addReplyBulkCString(c, g_pserver->fActiveReplica ? "yes" : "no");
+        matches++;
+    }
+    if (stringmatch(pattern, "tls-allowlist", 1)) {
+        addReplyBulkCString(c,"tls-allowlist");
+        addReplyArrayLen(c, (long)g_pserver->tls_allowlist.size());
+        for (auto &elem : g_pserver->tls_allowlist) {
+            addReplyBulkCBuffer(c, elem.get(), elem.size()); // addReplyBulkSds will free which we absolutely don't want
+        }
         matches++;
     }
 
@@ -1825,6 +1941,20 @@ int rewriteConfig(char *path, int force_all) {
     rewriteConfigStringOption(state, "version-override",KEYDB_SET_VERSION,KEYDB_REAL_VERSION);
     rewriteConfigOOMScoreAdjValuesOption(state);
 
+    if (!g_pserver->tls_allowlist.empty()) {
+        sds conf = sdsnew("tls-allowlist ");
+        for (auto &elem : g_pserver->tls_allowlist) {
+            conf = sdscatsds(conf, (sds)elem.get());
+            conf = sdscat(conf, " ");
+        }
+        // trim the trailing space
+        sdsrange(conf, 0, -1);
+        rewriteConfigRewriteLine(state,"tls-allowlist",conf,1 /*force*/);
+        // note: conf is owned by rewriteConfigRewriteLine - no need to free
+    } else {
+        rewriteConfigMarkAsProcessed(state, "tls-allowlist"); // ensure the line is removed if it existed
+    }
+
     /* Rewrite Sentinel config if in Sentinel mode. */
     if (g_pserver->sentinel_mode) rewriteConfigSentinelOption(state);
 
@@ -2392,8 +2522,12 @@ static int updateJemallocBgThread(int val, int prev, const char **err) {
 static int updateReplBacklogSize(long long val, long long prev, const char **err) {
     /* resizeReplicationBacklog sets g_pserver->repl_backlog_size, and relies on
      * being able to tell when the size changes, so restore prev before calling it. */
-    UNUSED(err);
+    if (cserver.repl_backlog_disk_size) {
+        *err = "Unable to dynamically resize the backlog because disk backlog is enabled";
+        return 0;
+    }
     g_pserver->repl_backlog_size = prev;
+    g_pserver->repl_backlog_config_size = val;
     resizeReplicationBacklog(val);
     return 1;
 }
@@ -2406,7 +2540,7 @@ static int updateMaxmemory(long long val, long long prev, const char **err) {
         if ((unsigned long long)val < used) {
             serverLog(LL_WARNING,"WARNING: the new maxmemory value set via CONFIG SET (%llu) is smaller than the current memory usage (%zu). This will result in key eviction and/or the inability to accept new write commands depending on the maxmemory-policy.", g_pserver->maxmemory, used);
         }
-        performEvictions();
+        performEvictions(false /*fPreSnapshot*/);
     }
     return 1;
 }
@@ -2643,13 +2777,21 @@ standardConfig configs[] = {
     createBoolConfig("cluster-enabled", NULL, IMMUTABLE_CONFIG, g_pserver->cluster_enabled, 0, NULL, NULL),
     createBoolConfig("appendonly", NULL, MODIFIABLE_CONFIG, g_pserver->aof_enabled, 0, NULL, updateAppendonly),
     createBoolConfig("cluster-allow-reads-when-down", NULL, MODIFIABLE_CONFIG, g_pserver->cluster_allow_reads_when_down, 0, NULL, NULL),
+    createBoolConfig("delete-on-evict", NULL, MODIFIABLE_CONFIG, cserver.delete_on_evict, 0, NULL, NULL),
+    createBoolConfig("use-fork", NULL, IMMUTABLE_CONFIG, cserver.fForkBgSave, 0, NULL, NULL),
     createBoolConfig("io-threads-do-reads", NULL, IMMUTABLE_CONFIG, fDummy, 0, NULL, NULL),
+    createBoolConfig("time-thread-priority", NULL, IMMUTABLE_CONFIG, cserver.time_thread_priority, 0, NULL, NULL),
+    createBoolConfig("prefetch-enabled", NULL, MODIFIABLE_CONFIG, g_pserver->prefetch_enabled, 1, NULL, NULL),
+    createBoolConfig("allow-rdb-resize-op", NULL, MODIFIABLE_CONFIG, g_pserver->allowRdbResizeOp, 1, NULL, NULL),
     createBoolConfig("crash-log-enabled", NULL, MODIFIABLE_CONFIG, g_pserver->crashlog_enabled, 1, NULL, updateSighandlerEnabled),
     createBoolConfig("crash-memcheck-enabled", NULL, MODIFIABLE_CONFIG, g_pserver->memcheck_enabled, 1, NULL, NULL),
     createBoolConfig("use-exit-on-panic", NULL, MODIFIABLE_CONFIG, g_pserver->use_exit_on_panic, 0, NULL, NULL),
     createBoolConfig("disable-thp", NULL, MODIFIABLE_CONFIG, g_pserver->disable_thp, 1, NULL, NULL),
     createBoolConfig("cluster-allow-replica-migration", NULL, MODIFIABLE_CONFIG, g_pserver->cluster_allow_replica_migration, 1, NULL, NULL),
     createBoolConfig("replica-announced", NULL, MODIFIABLE_CONFIG, g_pserver->replica_announced, 1, NULL, NULL),
+    createBoolConfig("enable-async-commands", NULL, MODIFIABLE_CONFIG, g_pserver->enable_async_commands, 0, NULL, NULL),
+    createBoolConfig("multithread-load-enabled", NULL, MODIFIABLE_CONFIG, g_pserver->multithread_load_enabled, 0, NULL, NULL),
+    createBoolConfig("active-client-balancing", NULL, MODIFIABLE_CONFIG, g_pserver->active_client_balancing, 1, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, g_pserver->acl_filename, "", NULL, NULL),
@@ -2665,6 +2807,7 @@ standardConfig configs[] = {
     createStringConfig("bio_cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, g_pserver->bio_cpulist, NULL, NULL, NULL),
     createStringConfig("aof_rewrite_cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, g_pserver->aof_rewrite_cpulist, NULL, NULL, NULL),
     createStringConfig("bgsave_cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, g_pserver->bgsave_cpulist, NULL, NULL, NULL),
+    createStringConfig("storage-provider-options", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, cserver.storage_conf, NULL, NULL, NULL),
     createStringConfig("ignore-warnings", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, g_pserver->ignore_warnings, "", NULL, NULL),
     createStringConfig("proc-title-template", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, cserver.proc_title_template, CONFIG_DEFAULT_PROC_TITLE_TEMPLATE, isValidProcTitleTemplate, updateProcTitleTemplate),
 
@@ -2679,6 +2822,7 @@ standardConfig configs[] = {
     createEnumConfig("loglevel", NULL, MODIFIABLE_CONFIG, loglevel_enum, cserver.verbosity, LL_NOTICE, NULL, NULL),
     createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, g_pserver->maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, NULL),
     createEnumConfig("appendfsync", NULL, MODIFIABLE_CONFIG, aof_fsync_enum, g_pserver->aof_fsync, AOF_FSYNC_EVERYSEC, NULL, NULL),
+    createEnumConfig("storage-cache-mode", NULL, IMMUTABLE_CONFIG, storage_memory_model_enum, cserver.storage_memory_model, STORAGE_WRITETHROUGH, NULL, NULL),
     createEnumConfig("oom-score-adj", NULL, MODIFIABLE_CONFIG, oom_score_adj_enum, g_pserver->oom_score_adj, OOM_SCORE_ADJ_NO, NULL, updateOOMScoreAdj),
     createEnumConfig("acl-pubsub-default", NULL, MODIFIABLE_CONFIG, acl_pubsub_default_enum, g_pserver->acl_pubsub_default, USER_FLAG_ALLCHANNELS, NULL, NULL),
     createEnumConfig("sanitize-dump-payload", NULL, MODIFIABLE_CONFIG, sanitize_dump_payload_enum, cserver.sanitize_dump_payload, SANITIZE_DUMP_NO, NULL, NULL),
@@ -2699,7 +2843,7 @@ standardConfig configs[] = {
     createIntConfig("lfu-decay-time", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, g_pserver->lfu_decay_time, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("replica-priority", "slave-priority", MODIFIABLE_CONFIG, 0, INT_MAX, g_pserver->slave_priority, 100, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("repl-diskless-sync-delay", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, g_pserver->repl_diskless_sync_delay, 5, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("maxmemory-samples", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, g_pserver->maxmemory_samples, 5, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("maxmemory-samples", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, g_pserver->maxmemory_samples, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("maxmemory-eviction-tenacity", NULL, MODIFIABLE_CONFIG, 0, 100, g_pserver->maxmemory_eviction_tenacity, 10, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("timeout", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, cserver.maxidletime, 0, INTEGER_CONFIG, NULL, NULL), /* Default client timeout: infinite */
     createIntConfig("replica-announce-port", "slave-announce-port", MODIFIABLE_CONFIG, 0, 65535, g_pserver->slave_announce_port, 0, INTEGER_CONFIG, NULL, NULL),
@@ -2717,8 +2861,11 @@ standardConfig configs[] = {
     createIntConfig("min-replicas-to-write", "min-slaves-to-write", MODIFIABLE_CONFIG, 0, INT_MAX, g_pserver->repl_min_slaves_to_write, 0, INTEGER_CONFIG, NULL, updateGoodSlaves),
     createIntConfig("min-replicas-max-lag", "min-slaves-max-lag", MODIFIABLE_CONFIG, 0, INT_MAX, g_pserver->repl_min_slaves_max_lag, 10, INTEGER_CONFIG, NULL, updateGoodSlaves),
     createIntConfig("min-clients-per-thread", NULL, MODIFIABLE_CONFIG, 0, 400, cserver.thread_min_client_threshold, 20, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("storage-flush-period", NULL, MODIFIABLE_CONFIG, 1, 10000, g_pserver->storage_flush_period, 500, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("replica-quorum", NULL, MODIFIABLE_CONFIG, -1, INT_MAX, g_pserver->repl_quorum, -1, INTEGER_CONFIG, NULL, NULL),
-    /* Unsigned int configs */
+    createIntConfig("replica-weighting-factor", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, g_pserver->replicaIsolationFactor, 2, INTEGER_CONFIG, NULL, NULL),
+
+		/* Unsigned int configs */
     createUIntConfig("maxclients", NULL, MODIFIABLE_CONFIG, 1, UINT_MAX, g_pserver->maxclients, 10000, INTEGER_CONFIG, NULL, updateMaxclients),
     createUIntConfig("loading-process-events-interval-keys", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, g_pserver->loading_process_events_interval_keys, 8192, MEMORY_CONFIG, NULL, NULL),
 
@@ -2735,9 +2882,12 @@ standardConfig configs[] = {
     createLongLongConfig("proto-max-bulk-len", NULL, MODIFIABLE_CONFIG, 1024*1024, LLONG_MAX, g_pserver->proto_max_bulk_len, 512ll*1024*1024, MEMORY_CONFIG, NULL, NULL), /* Bulk request max size */
     createLongLongConfig("stream-node-max-entries", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, g_pserver->stream_node_max_entries, 100, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("repl-backlog-size", NULL, MODIFIABLE_CONFIG, 1, LLONG_MAX, g_pserver->repl_backlog_size, 1024*1024, MEMORY_CONFIG, NULL, updateReplBacklogSize), /* Default: 1mb */
+    createLongLongConfig("repl-backlog-disk-reserve", NULL, IMMUTABLE_CONFIG, 0, LLONG_MAX, cserver.repl_backlog_disk_size, 0, MEMORY_CONFIG, NULL, NULL),
+    createLongLongConfig("max-snapshot-slip", NULL, MODIFIABLE_CONFIG, 0, 5000, g_pserver->snapshot_slip, 400, 0, NULL, NULL),
 
     /* Unsigned Long Long configs */
     createULongLongConfig("maxmemory", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, g_pserver->maxmemory, 0, MEMORY_CONFIG, NULL, updateMaxmemory),
+    createULongLongConfig("maxstorage", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, g_pserver->maxstorage, 0, MEMORY_CONFIG, NULL, NULL),
 
     /* Size_t configs */
     createSizeTConfig("hash-max-ziplist-entries", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, g_pserver->hash_max_ziplist_entries, 512, INTEGER_CONFIG, NULL, NULL),
@@ -2759,8 +2909,10 @@ standardConfig configs[] = {
     createULongConfig("loading-process-events-interval-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, g_pserver->loading_process_events_interval_bytes, 2*1024*1024, MEMORY_CONFIG, NULL, NULL),
     createBoolConfig("multi-master-no-forward", NULL, MODIFIABLE_CONFIG, cserver.multimaster_no_forward, 0, validateMultiMasterNoForward, NULL),
     createBoolConfig("allow-write-during-load", NULL, MODIFIABLE_CONFIG, g_pserver->fWriteDuringActiveLoad, 0, NULL, NULL),
+    createBoolConfig("force-backlog-disk-reserve", NULL, MODIFIABLE_CONFIG, cserver.force_backlog_disk, 0, NULL, NULL),
+    createBoolConfig("soft-shutdown", NULL, MODIFIABLE_CONFIG, g_pserver->config_soft_shutdown, 0, NULL, NULL),
 
-    /* Auto convert intset encoding */
+    /* Auto convert intset encoding, //dkmods */
     createBoolConfig("auto-convert-intset-encoding", NULL, MODIFIABLE_CONFIG, g_pserver->auto_convert_intset_encoding, 1, NULL, NULL),
 
 #ifdef USE_OPENSSL
@@ -2772,6 +2924,7 @@ standardConfig configs[] = {
     createEnumConfig("tls-auth-clients", NULL, MODIFIABLE_CONFIG, tls_auth_clients_enum, g_pserver->tls_auth_clients, TLS_CLIENT_AUTH_YES, NULL, NULL),
     createBoolConfig("tls-prefer-server-ciphers", NULL, MODIFIABLE_CONFIG, g_pserver->tls_ctx_config.prefer_server_ciphers, 0, NULL, updateTlsCfgBool),
     createBoolConfig("tls-session-caching", NULL, MODIFIABLE_CONFIG, g_pserver->tls_ctx_config.session_caching, 1, NULL, updateTlsCfgBool),
+    createBoolConfig("tls-rotation", NULL, MODIFIABLE_CONFIG, g_pserver->tls_rotation, 0, NULL, updateTlsCfgBool),
     createStringConfig("tls-cert-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, g_pserver->tls_ctx_config.cert_file, NULL, NULL, updateTlsCfg),
     createStringConfig("tls-key-file", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, g_pserver->tls_ctx_config.key_file, NULL, NULL, updateTlsCfg),
     createStringConfig("tls-key-file-pass", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, g_pserver->tls_ctx_config.key_file_pass, NULL, NULL, updateTlsCfg),
@@ -2815,7 +2968,7 @@ NULL
         };
 
         addReplyHelp(c, help);
-    } else if (!strcasecmp(szFromObj(c->argv[1]),"set") && c->argc == 4) {
+    } else if (!strcasecmp(szFromObj(c->argv[1]),"set") && c->argc >= 3) {
         configSetCommand(c);
     } else if (!strcasecmp(szFromObj(c->argv[1]),"get") && c->argc == 3) {
         configGetCommand(c);

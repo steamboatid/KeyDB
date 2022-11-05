@@ -1,7 +1,7 @@
 start_server {tags {"introspection"}} {
     test {CLIENT LIST} {
         r client list
-    } {*addr=*:* fd=* age=* idle=* flags=N db=9 sub=0 psub=0 multi=-1 qbuf=26 qbuf-free=* argv-mem=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client*}
+    } {*addr=*:* fd=* age=* idle=* flags=N db=9 sub=0 psub=0 multi=-1 qbuf=0 qbuf-free=* argv-mem=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client*}
 
     test {CLIENT LIST with IDs} {
         set myid [r client id]
@@ -11,7 +11,7 @@ start_server {tags {"introspection"}} {
 
     test {CLIENT INFO} {
         r client info
-    } {*addr=*:* fd=* age=* idle=* flags=N db=9 sub=0 psub=0 multi=-1 qbuf=26 qbuf-free=* argv-mem=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client*}
+    } {*addr=*:* fd=* age=* idle=* flags=N db=9 sub=0 psub=0 multi=-1 qbuf=0 qbuf-free=* argv-mem=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client*}
 
     test {MONITOR can log executed commands} {
         set rd [redis_deferring_client]
@@ -90,6 +90,11 @@ start_server {tags {"introspection"}} {
         set e
     } {ERR*}
 
+    test {replica-weighting-factor does not accept values less than 1} {
+        catch {r config set replica-weighting-factor 0} e
+        set e
+    } {ERR*}
+
     test {CLIENT SETNAME can assign a name to this connection} {
         assert_equal [r client setname myname] {OK}
         r client list
@@ -155,11 +160,17 @@ start_server {tags {"introspection"}} {
             server_cpulist
             bio_cpulist
             aof_rewrite_cpulist
+            time-thread-priority
             bgsave_cpulist
+	        storage-cache-mode
+	        storage-provider-options
+	        use-fork
             multi-master
             active-replica
             bind
             set-proc-title
+            repl-backlog-disk-reserve
+	    tls-allowlist
         }
 
         if {!$::tls} {

@@ -172,6 +172,9 @@ void aeThreadOffline();
 void aeReleaseLock();
 void aeReleaseForkLock();
 int aeThreadOwnsLock();
+void aeSetThreadOwnsLockOverride(int fOverride);
+int aeLockContested(int threshold);
+int aeLockContention(); // returns the number of instantaneous threads waiting on the lock
 
 #ifdef __cplusplus
 }

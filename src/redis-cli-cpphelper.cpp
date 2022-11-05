@@ -431,7 +431,7 @@ int clusterManagerGetAntiAffinityScore(clusterManagerNodeArray *ipnodes,
                 }
             }
         }
-        //if (offending_len != NULL) *offending_len = offending_p - *offending;
+        if (offending_len != NULL) *offending_len = offending_p - *offending;
         dictReleaseIterator(iter);
         dictRelease(related);
     }

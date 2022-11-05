@@ -16,7 +16,7 @@ _keydb-cli()
     #
     #  All known commands accepted.  Sorted.
     #
-    opts='bgrewriteaof bgsave dbsize debug decr decrby del echo exists expire expireat flushall flushdb get getset incr incrby info keys lastsave lindex llen lpop lpush lrange lrem lset ltrim mget move mset msetnx ping randomkey rename renamenx rewriteaof rpop rpoplpush rpush sadd save scard sdiff sdiffstore select set setnx shutdown sinter sinterstore sismember slaveof smembers smove sort spop srandmember srem sunion sunionstore ttl type zadd zcard zincrby zrange zrangebyscore zrem zremrangebyscore zrevrange zscore'
+    opts='bgrewriteaof bgsave dbsize debug decr decrby del echo exists expire expireat flushall flushdb get getset incr incrby info keys lastsave lindex llen lpop lpush lrange lrem lset ltrim mget move mset msetnx ping randomkey rename renamenx rewriteaof rpop rpoplpush rpush sadd saddint save scard sdiff sdiffstore select set setnx shutdown sinter sinterstore sismember slaveof smembers smove sort spop srandmember srem sunion sunionstore ttl type zadd zcard zincrby zrange zrangebyscore zrem zremrangebyscore zrevrange zscore'
 
     #
     #  Only complete on the first term.

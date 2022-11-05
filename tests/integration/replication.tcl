@@ -509,7 +509,7 @@ test {diskless loading short read} {
             for {set i 0} {$i < $attempts} {incr i} {
                 # wait for the replica to start reading the rdb
                 # using the log file since the replica only responds to INFO once in 2mb
-                set res [wait_for_log_messages -1 {"*Loading DB in memory*"} $loglines 2000 1]
+                set res [wait_for_log_messages -1 {"*Loading DB in memory*"} $loglines 2000 10]
                 set loglines [lindex $res 1]
 
                 # add some additional random sleep so that we kill the master on a different place each time
@@ -729,6 +729,8 @@ start_server {tags {"repl"}} {
     }
 }
 
+if 0 {
+    # This test is not applicable to forkless bgsave
 test "diskless replication child being killed is collected" {
     # when diskless master is waiting for the replica to become writable
     # it removes the read event from the rdb pipe so if the child gets killed
@@ -769,7 +771,7 @@ test "diskless replication child being killed is collected" {
         }
     }
 }
-
+    # Neither is this test
 test "diskless replication read pipe cleanup" {
     # In diskless replication, we create a read pipe for the RDB, between the child and the parent.
     # When we close this pipe (fd), the read handler also needs to be removed from the event loop (if it still registered).
@@ -807,6 +809,7 @@ test "diskless replication read pipe cleanup" {
             $master ping
         }
     }
+}
 }
 
 test {replicaof right after disconnection} {

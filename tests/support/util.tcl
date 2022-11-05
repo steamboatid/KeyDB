@@ -110,6 +110,7 @@ proc wait_for_ofs_sync {r1 r2} {
     } else {
         fail "replica didn't sync in time"
     }
+    $r2 lfence
 }
 
 proc wait_done_loading r {
@@ -542,8 +543,17 @@ proc start_bg_complex_data {host port db ops} {
     exec $tclsh tests/helpers/bg_complex_data.tcl $host $port $db $ops $::tls &
 }
 
+proc start_climbing_load {host port db ops} {
+    set tclsh [info nameofexecutable]
+    exec $tclsh tests/helpers/gen_climbing_load.tcl $host $port $db $ops $::tls &
+}
+
 # Stop a process generating write load executed with start_bg_complex_data.
 proc stop_bg_complex_data {handle} {
+    catch {exec /bin/kill -9 $handle}
+}
+
+proc stop_climbing_load {handle} {
     catch {exec /bin/kill -9 $handle}
 }
 
@@ -591,7 +601,7 @@ proc generate_fuzzy_traffic_on_key {key duration} {
     set hash_commands {HDEL HEXISTS HGET HGETALL HINCRBY HINCRBYFLOAT HKEYS HLEN HMGET HMSET HSCAN HSET HSETNX HSTRLEN HVALS HRANDFIELD}
     set zset_commands {ZADD ZCARD ZCOUNT ZINCRBY ZINTERSTORE ZLEXCOUNT ZPOPMAX ZPOPMIN ZRANGE ZRANGEBYLEX ZRANGEBYSCORE ZRANK ZREM ZREMRANGEBYLEX ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREVRANGE ZREVRANGEBYLEX ZREVRANGEBYSCORE ZREVRANK ZSCAN ZSCORE ZUNIONSTORE ZRANDMEMBER}
     set list_commands {LINDEX LINSERT LLEN LPOP LPOS LPUSH LPUSHX LRANGE LREM LSET LTRIM RPOP RPOPLPUSH RPUSH RPUSHX}
-    set set_commands {SADD SCARD SDIFF SDIFFSTORE SINTER SINTERSTORE SISMEMBER SMEMBERS SMOVE SPOP SRANDMEMBER SREM SSCAN SUNION SUNIONSTORE}
+    set set_commands {SADD SADDINT SCARD SDIFF SDIFFSTORE SINTER SINTERSTORE SISMEMBER SMEMBERS SMOVE SPOP SRANDMEMBER SREM SSCAN SUNION SUNIONSTORE}
     set stream_commands {XACK XADD XCLAIM XDEL XGROUP XINFO XLEN XPENDING XRANGE XREAD XREADGROUP XREVRANGE XTRIM}
     set commands [dict create string $string_commands hash $hash_commands zset $zset_commands list $list_commands set $set_commands stream $stream_commands]
 

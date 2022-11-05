@@ -29,6 +29,7 @@
 
 #include "server.h"
 #include "connhelpers.h"
+#include "aelocker.h"
 
 /* The connections module provides a lean abstraction of network connections
  * to avoid direct socket and async event management across the Redis code base.
@@ -112,7 +113,7 @@ static int connSocketConnect(connection *conn, const char *addr, int port, const
     conn->state = CONN_STATE_CONNECTING;
 
     conn->conn_handler = connect_handler;
-    aeCreateFileEvent(serverTL->el, conn->fd, AE_WRITABLE,
+    aeCreateFileEvent(serverTL->el, conn->fd, AE_WRITABLE|AE_WRITE_THREADSAFE,
             conn->type->ae_handler, conn);
 
     return C_OK;
@@ -225,14 +226,15 @@ static int connSocketSetWriteHandler(connection *conn, ConnectionCallbackFunc fu
     else
         conn->flags &= ~CONN_FLAG_WRITE_BARRIER;
 
-    int flags = AE_WRITABLE;
     if (fThreadSafe)
-        flags |= AE_WRITE_THREADSAFE;
+        conn->flags |= CONN_FLAG_WRITE_THREADSAFE;
+    else
+        conn->flags &= ~CONN_FLAG_WRITE_THREADSAFE;
 
     if (!conn->write_handler)
         aeDeleteFileEvent(serverTL->el,conn->fd,AE_WRITABLE);
     else
-        if (aeCreateFileEvent(serverTL->el,conn->fd,flags,
+        if (aeCreateFileEvent(serverTL->el,conn->fd,AE_WRITABLE|AE_WRITE_THREADSAFE,
                     conn->type->ae_handler,conn) == AE_ERR) return C_ERR;
     return C_OK;
 }
@@ -242,17 +244,18 @@ static int connSocketSetWriteHandler(connection *conn, ConnectionCallbackFunc fu
  */
 static int connSocketSetReadHandler(connection *conn, ConnectionCallbackFunc func, bool fThreadSafe) {
     if (func == conn->read_handler) return C_OK;
-
-    int flags = AE_READABLE;
+    
     if (fThreadSafe)
-        flags |= AE_READ_THREADSAFE;
+        conn->flags |= CONN_FLAG_READ_THREADSAFE;
+    else
+        conn->flags &= ~CONN_FLAG_READ_THREADSAFE;
 
     conn->read_handler = func;
     if (!conn->read_handler)
         aeDeleteFileEvent(serverTL->el,conn->fd,AE_READABLE);
     else
         if (aeCreateFileEvent(serverTL->el,conn->fd,
-                    flags,conn->type->ae_handler,conn) == AE_ERR) return C_ERR;
+                    AE_READABLE|AE_READ_THREADSAFE,conn->type->ae_handler,conn) == AE_ERR) return C_ERR;
     return C_OK;
 }
 
@@ -260,7 +263,7 @@ static const char *connSocketGetLastError(connection *conn) {
     return strerror(conn->last_errno);
 }
 
-static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask)
+void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask)
 {
     UNUSED(el);
     UNUSED(fd);
@@ -279,7 +282,11 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
 
         if (!conn->write_handler) aeDeleteFileEvent(serverTL->el,conn->fd,AE_WRITABLE);
 
+        {
+        AeLocker locker;
+        locker.arm(nullptr);
         if (!callHandler(conn, conn->conn_handler)) return;
+        }
         conn->conn_handler = NULL;
     }
 
@@ -301,15 +308,27 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
 
     /* Handle normal I/O flows */
     if (!invert && call_read) {
+        AeLocker lock;
+        if (!(conn->flags & CONN_FLAG_READ_THREADSAFE))
+            lock.arm(nullptr);
+        
         if (!callHandler(conn, conn->read_handler)) return;
     }
     /* Fire the writable event. */
     if (call_write) {
+        AeLocker lock;
+        if (!(conn->flags & CONN_FLAG_WRITE_THREADSAFE))
+            lock.arm(nullptr);
+
         if (!callHandler(conn, conn->write_handler)) return;
     }
     /* If we have to invert the call, fire the readable event now
      * after the writable one. */
     if (invert && call_read) {
+        AeLocker lock;
+        if (!(conn->flags & CONN_FLAG_READ_THREADSAFE))
+            lock.arm(nullptr);
+        
         if (!callHandler(conn, conn->read_handler)) return;
     }
 }

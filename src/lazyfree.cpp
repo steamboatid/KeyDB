@@ -143,19 +143,28 @@ size_t lazyfreeGetFreeEffort(robj *key, robj *obj) {
  * a lazy free list instead of being freed synchronously. The lazy free list
  * will be reclaimed in a different bio.c thread. */
 #define LAZYFREE_THRESHOLD 64
-int dbAsyncDelete(redisDb *db, robj *key) {
+bool redisDbPersistentData::asyncDelete(robj *key) {
     /* If the value is composed of a few allocations, to free in a lazy way
      * is actually just slower... So under a certain limit we just free
      * the object synchronously. */
-    dictEntry *de = dictUnlink(db->dict,ptrFromObj(key));
-    if (de) {
-        robj *val = (robj*)dictGetVal(de);
 
+    if (m_spstorage != nullptr)
+        return syncDelete(key); // async delte never makes sense with a storage provider
+
+    dictEntry *de = dictUnlink(m_pdict,ptrFromObj(key));
+    if (de) {
+        if (m_pdbSnapshot != nullptr && m_pdbSnapshot->find_cached_threadsafe(szFromObj(key)) != nullptr)
+        {
+            uint64_t hash = dictGetHash(m_pdict, szFromObj(key));
+            dictAdd(m_pdictTombstone, sdsdup((sds)dictGetKey(de)), (void*)hash);
+        }
+
+        robj *val = (robj*)dictGetVal(de);
         if (val->FExpires())
         {
             /* Deleting an entry from the expires dict will not free the sds of
              * the key, because it is shared with the main dictionary. */
-            removeExpireCore(db,key,de);
+            removeExpire(key,dict_iter(m_pdict, de));
         }
 
         /* Tells the module that the key has been unlinked from the database. */
@@ -174,19 +183,23 @@ int dbAsyncDelete(redisDb *db, robj *key) {
         if (free_effort > LAZYFREE_THRESHOLD && val->getrefcount(std::memory_order_relaxed) == 1) {
             atomicIncr(lazyfree_objects,1);
             bioCreateLazyFreeJob(lazyfreeFreeObject,1, val);
-            dictSetVal(db->dict,de,NULL);
+            dictSetVal(m_pdict,de,NULL);
         }
     }
 
     /* Release the key-val pair, or just the key if we set the val
      * field to NULL in order to lazy free it later. */
     if (de) {
-        dictFreeUnlinkedEntry(db->dict,de);
+        dictFreeUnlinkedEntry(m_pdict,de);
         if (g_pserver->cluster_enabled) slotToKeyDel(szFromObj(key));
-        return 1;
+        return true;
     } else {
-        return 0;
+        return false;
     }
+}
+
+int dbAsyncDelete(redisDb *db, robj *key) {
+    return db->asyncDelete(key);
 }
 
 /* Free an object, if the object is huge enough, free it in async way. */
@@ -203,12 +216,16 @@ void freeObjAsync(robj *key, robj *obj) {
 /* Empty a Redis DB asynchronously. What the function does actually is to
  * create a new empty set of hash tables and scheduling the old ones for
  * lazy freeing. */
-void emptyDbAsync(redisDb *db) {
-    dict *oldht1 = db->dict;
-    auto *set = db->setexpire;
-    db->setexpire = new (MALLOC_LOCAL) expireset();
-    db->expireitr = db->setexpire->end();
-    db->dict = dictCreate(&dbDictType,NULL);
+void redisDbPersistentData::emptyDbAsync() {
+    std::unique_lock<fastlock> ul(g_expireLock);
+    dict *oldht1 = m_pdict;
+    auto *set = m_setexpire;
+    m_setexpire = new (MALLOC_LOCAL) expireset();
+    m_pdict = dictCreate(&dbDictType,this);
+    if (m_spstorage != nullptr)
+        m_spstorage->clearAsync();
+    if (m_fTrackingChanges)
+        m_fAllChanged = true;
     atomicIncr(lazyfree_objects,dictSize(oldht1));
     bioCreateLazyFreeJob(lazyfreeFreeDatabase,2,oldht1,set);
 }

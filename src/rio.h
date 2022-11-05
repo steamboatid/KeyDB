@@ -58,6 +58,7 @@ struct _rio {
      * and len fields pointing to the new block of data to add to the checksum
      * computation. */
     void (*update_cksum)(struct _rio *, const void *buf, size_t len);
+    void *chksum_arg;
 
     /* The current checksum and flags (see RIO_FLAG_*) */
     uint64_t cksum, flags;
@@ -71,12 +72,16 @@ struct _rio {
     /* maximum single read or write chunk size */
     size_t max_processing_chunk;
 
+    /* last update time */
+    long long last_update;
+
     /* Backend-specific vars. */
     union {
         /* In-memory buffer target. */
         struct {
             sds ptr;
             off_t pos;
+            off_t len;  // For const buffers only
         } buffer;
         /* Stdio file pointer target. */
         struct {
@@ -165,6 +170,7 @@ static inline void rioClearErrors(rio *r) {
 
 void rioInitWithFile(rio *r, FILE *fp);
 void rioInitWithBuffer(rio *r, sds s);
+void rioInitWithConstBuffer(rio *r, const void *rgch, size_t cch);
 void rioInitWithConn(rio *r, connection *conn, size_t read_limit);
 void rioInitWithFd(rio *r, int fd);
 

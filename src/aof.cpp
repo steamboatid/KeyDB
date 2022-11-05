@@ -765,7 +765,7 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
 /* In Redis commands are always executed in the context of a client, so in
  * order to load the append only file we need to create a fake client. */
 struct client *createAOFClient(void) {
-    struct client *c =(client*) zmalloc(sizeof(*c), MALLOC_LOCAL);
+    struct client *c = new client();
 
     selectDb(c,0);
     c->id = CLIENT_ID_AOF; /* So modules can identify it's the AOF client. */
@@ -778,7 +778,6 @@ struct client *createAOFClient(void) {
     c->argv = NULL;
     c->original_argc = 0;
     c->original_argv = NULL;
-    c->argv_len_sum = 0;
     c->bufpos = 0;
     c->fPendingAsyncWrite = FALSE;
     c->fPendingAsyncWriteHandler = FALSE;
@@ -806,6 +805,7 @@ struct client *createAOFClient(void) {
     c->sockname = NULL;
     c->resp = 2;
     c->user = NULL;
+    c->mvccCheckpoint = 0;
     listSetFreeMethod(c->reply,freeClientReplyValue);
     listSetDupMethod(c->reply,dupClientReplyValue);
     fastlock_init(&c->lock, "fake client");
@@ -820,7 +820,7 @@ void freeFakeClientArgv(struct client *c) {
     for (j = 0; j < c->argc; j++)
         decrRefCount(c->argv[j]);
     zfree(c->argv);
-    c->argv_len_sum = 0;
+    c->argv_len_sumActive = 0;
 }
 
 void freeFakeClient(struct client *c) {
@@ -831,7 +831,7 @@ void freeFakeClient(struct client *c) {
     freeClientOriginalArgv(c);
     fastlock_unlock(&c->lock);
     fastlock_free(&c->lock);
-    zfree(c);
+    delete c;
 }
 
 /* Replay the append log file. On success C_OK is returned. On non fatal
@@ -869,6 +869,11 @@ int loadAppendOnlyFile(char *filename) {
 
     fakeClient = createAOFClient();
     startLoadingFile(fp, filename, RDBFLAGS_AOF_PREAMBLE);
+
+    for (int idb = 0; idb < cserver.dbnum; ++idb)
+    {
+        g_pserver->db[idb]->trackChanges(true);
+    }
 
     /* Check if this AOF file has an RDB preamble. In that case we need to
      * load the RDB file and later continue loading the AOF tail. */
@@ -1005,6 +1010,11 @@ int loadAppendOnlyFile(char *filename) {
     }
 
 loaded_ok: /* DB loaded, cleanup and return C_OK to the caller. */
+    for (int idb = 0; idb < cserver.dbnum; ++idb)
+    {
+        if (g_pserver->db[idb]->processChanges(false))
+            g_pserver->db[idb]->commitChanges();
+    }
     fclose(fp);
     freeFakeClient(fakeClient);
     g_pserver->aof_state = old_aof_state;
@@ -1137,7 +1147,7 @@ int rewriteSetObject(rio *r, robj *key, robj *o) {
 
                 if (!rioWriteBulkCount(r,'*',2+cmd_items) ||
                     !rioWriteBulkString(r,"SADD",4) ||
-                    !rioWriteBulkString(r,"SADDINT",4) ||
+                    !rioWriteBulkString(r,"SADDINT",4) || /*//dkmods*/
                     !rioWriteBulkObject(r,key)) 
                 {
                     return 0;
@@ -1159,6 +1169,7 @@ int rewriteSetObject(rio *r, robj *key, robj *o) {
 
                 if (!rioWriteBulkCount(r,'*',2+cmd_items) ||
                     !rioWriteBulkString(r,"SADD",4) ||
+									  !rioWriteBulkString(r,"SADDINT",4) || /*//dkmods*/
                     !rioWriteBulkObject(r,key)) 
                 {
                     dictReleaseIterator(di);
@@ -1539,8 +1550,6 @@ ssize_t aofReadDiffFromParent(void) {
 }
 
 int rewriteAppendOnlyFileRio(rio *aof) {
-    dictIterator *di = NULL;
-    dictEntry *de;
     size_t processed = 0;
     int j;
     long key_count = 0;
@@ -1548,69 +1557,63 @@ int rewriteAppendOnlyFileRio(rio *aof) {
 
     for (j = 0; j < cserver.dbnum; j++) {
         char selectcmd[] = "*2\r\n$6\r\nSELECT\r\n";
-        redisDb *db = g_pserver->db+j;
-        dict *d = db->dict;
-        if (dictSize(d) == 0) continue;
-        di = dictGetSafeIterator(d);
+        redisDb *db = g_pserver->db[j];
+        if (db->size() == 0) continue;
 
         /* SELECT the new DB */
         if (rioWrite(aof,selectcmd,sizeof(selectcmd)-1) == 0) goto werr;
         if (rioWriteBulkLongLong(aof,j) == 0) goto werr;
 
         /* Iterate this DB writing every entry */
-        while((de = dictNext(di)) != NULL) {
-            sds keystr;
+        bool fComplete = db->iterate([&](const char *keystr, robj *o)->bool{
             redisObjectStack key;
-            robj *o = nullptr;
-
-            keystr = (sds)dictGetKey(de);
-            o = (robj*)dictGetVal(de);
-            initStaticStringObject(key,keystr);
-
-            expireEntry *pexpire = getExpire(db,&key);
+            initStaticStringObject(key,(sds)keystr);
 
             /* Save the key and associated value */
             if (o->type == OBJ_STRING) {
                 /* Emit a SET command */
                 char cmd[]="*3\r\n$3\r\nSET\r\n";
-                if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) goto werr;
+                if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) return false;
                 /* Key and value */
-                if (rioWriteBulkObject(aof,&key) == 0) goto werr;
-                if (rioWriteBulkObject(aof,o) == 0) goto werr;
+                if (rioWriteBulkObject(aof,&key) == 0) return false;
+                if (rioWriteBulkObject(aof,o) == 0) return false;
             } else if (o->type == OBJ_LIST) {
-                if (rewriteListObject(aof,&key,o) == 0) goto werr;
+                if (rewriteListObject(aof,&key,o) == 0) return false;
             } else if (o->type == OBJ_SET) {
-                if (rewriteSetObject(aof,&key,o) == 0) goto werr;
+                if (rewriteSetObject(aof,&key,o) == 0) return false;
             } else if (o->type == OBJ_ZSET) {
-                if (rewriteSortedSetObject(aof,&key,o) == 0) goto werr;
+                if (rewriteSortedSetObject(aof,&key,o) == 0) return false;
             } else if (o->type == OBJ_HASH) {
-                if (rewriteHashObject(aof,&key,o) == 0) goto werr;
+                if (rewriteHashObject(aof,&key,o) == 0) return false;
             } else if (o->type == OBJ_STREAM) {
-                if (rewriteStreamObject(aof,&key,o) == 0) goto werr;
+                if (rewriteStreamObject(aof,&key,o) == 0) return false;
             } else if (o->type == OBJ_MODULE) {
-                if (rewriteModuleObject(aof,&key,o) == 0) goto werr;
+                if (rewriteModuleObject(aof,&key,o) == 0) return false;
             } else {
                 serverPanic("Unknown object type");
             }
             /* Save the expire time */
-            if (pexpire != nullptr) {
+            if (o->FExpires()) {
+                std::unique_lock<fastlock> ul(g_expireLock);
+                expireEntry *pexpire = db->getExpire(&key);
                 for (auto &subExpire : *pexpire) {
                     if (subExpire.subkey() == nullptr)
                     {
                         char cmd[]="*3\r\n$9\r\nPEXPIREAT\r\n";
-                        if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) goto werr;
-                        if (rioWriteBulkObject(aof,&key) == 0) goto werr;
+                        if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) return false;
+                        if (rioWriteBulkObject(aof,&key) == 0) return false;
                     }
                     else
                     {
                         char cmd[]="*4\r\n$12\r\nPEXPIREMEMBERAT\r\n";
-                        if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) goto werr;
-                        if (rioWriteBulkObject(aof,&key) == 0) goto werr;
-                        if (rioWrite(aof,subExpire.subkey(),sdslen(subExpire.subkey())) == 0) goto werr;
+                        if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) return false;
+                        if (rioWriteBulkObject(aof,&key) == 0) return false;
+                        if (rioWrite(aof,subExpire.subkey(),sdslen(subExpire.subkey())) == 0) return false;
                     }
-                    if (rioWriteBulkLongLong(aof,subExpire.when()) == 0) goto werr; // common
+                    if (rioWriteBulkLongLong(aof,subExpire.when()) == 0) return false; // common
                 }
             }
+            
             /* Read some diff from the parent process from time to time. */
             if (aof->processed_bytes > processed+AOF_READ_DIFF_INTERVAL_BYTES) {
                 processed = aof->processed_bytes;
@@ -1627,14 +1630,15 @@ int rewriteAppendOnlyFileRio(rio *aof) {
                     updated_time = now;
                 }
             }
-        }
-        dictReleaseIterator(di);
-        di = NULL;
+
+            return true;
+        });
+        if (!fComplete)
+            goto werr;
     }
     return C_OK;
 
 werr:
-    if (di) dictReleaseIterator(di);
     return C_ERR;
 }
 
@@ -1673,7 +1677,12 @@ int rewriteAppendOnlyFile(char *filename) {
 
     if (g_pserver->aof_use_rdb_preamble) {
         int error;
-        if (rdbSaveRio(&aof,&error,RDBFLAGS_AOF_PREAMBLE,NULL) == C_ERR) {
+        std::vector<const redisDbPersistentDataSnapshot*> vecpdb;
+        for (int idb = 0; idb < cserver.dbnum; ++idb)
+        {
+            vecpdb.push_back(g_pserver->db[idb]);
+        }
+        if (rdbSaveRio(&aof,vecpdb.data(),&error,RDBFLAGS_AOF_PREAMBLE,NULL) == C_ERR) {
             errno = error;
             goto werr;
         }

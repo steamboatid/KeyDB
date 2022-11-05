@@ -33,6 +33,8 @@
 #include "server.h"
 #include "cron.h"
 
+fastlock g_expireLock {"Expire"};
+
 /* Helper function for the activeExpireCycle() function.
  * This function will try to expire the key that is stored in the hash table
  * entry 'de' of the 'expires' hash table of a Redis database.
@@ -81,8 +83,7 @@ int activeExpireCycleExpire(redisDb *db, expireEntry &e, long long now, size_t &
     }
 
     expireEntryFat *pfat = e.pfatentry();
-    dictEntry *de = dictFind(db->dict, e.key());
-    robj *val = (robj*)dictGetVal(de);
+    robj *val = db->find(e.key());
     int deleted = 0;
 
     redisObjectStack objKey;
@@ -162,13 +163,14 @@ int activeExpireCycleExpire(redisDb *db, expireEntry &e, long long now, size_t &
         }
     }
 
-    if (!pfat->FEmpty() && fTtlChanged)
+    if (pfat->FEmpty())
+    {
+        removeExpire(db, &objKey);
+    }
+    else if (!pfat->FEmpty() && fTtlChanged)
     {
         // We need to resort the expire entry since it may no longer be in the correct position
-        auto itr = db->setexpire->find(e.key());
-        expireEntry eT = std::move(e);
-        db->setexpire->erase(itr);
-        db->setexpire->insert(eT);
+        db->resortExpire(e);
     }
 
     if (deleted)
@@ -182,10 +184,6 @@ int activeExpireCycleExpire(redisDb *db, expireEntry &e, long long now, size_t &
         }
     }
 
-    if (pfat->FEmpty())
-    {
-        removeExpire(db, &objKey);
-    }
     return deleted;
 }
 
@@ -216,7 +214,7 @@ void expireMemberCore(client *c, robj *key, robj *subkey, long long basetime, lo
 
     /* No key, return zero. */
     robj *val = lookupKeyWriteOrReply(c, key, shared.czero);
-    if (val == NULL) {
+    if (val == nullptr) {
         return;
     }
 
@@ -373,7 +371,7 @@ void activeExpireCycleCore(int type) {
     long total_expired = 0;
 
     for (j = 0; j < dbs_per_call && timelimit_exit == 0; j++) {
-        redisDb *db = g_pserver->db+(current_db % cserver.dbnum);
+        redisDb *db = g_pserver->db[(current_db % cserver.dbnum)];
 
         /* Increment the DB now so we are sure if we run out of time
          * in the current DB we'll restart from the next. This allows to
@@ -385,17 +383,18 @@ void activeExpireCycleCore(int type) {
         now = mstime();
 
         /* If there is nothing to expire try next DB ASAP. */
-        if (db->setexpire->empty())
+        if (db->setexpireUnsafe()->empty())
         {
             db->avg_ttl = 0;
             db->last_expire_set = now;
             continue;
         }
         
+        std::unique_lock<fastlock> ul(g_expireLock);
         size_t expired = 0;
         size_t tried = 0;
         long long check = ACTIVE_EXPIRE_CYCLE_FAST_DURATION;    // assume a check is roughly 1us.  It isn't but good enough
-        db->expireitr = db->setexpire->enumerate(db->expireitr, now, [&](expireEntry &e) __attribute__((always_inline)) {
+        db->expireitr = db->setexpireUnsafe()->enumerate(db->expireitr, now, [&](expireEntry &e) __attribute__((always_inline)) {
             if (e.when() < now)
             {
                 expired += activeExpireCycleExpire(db, e, now, tried);
@@ -495,20 +494,20 @@ void expireSlaveKeys(void) {
         int dbid = 0;
         while(dbids && dbid < cserver.dbnum) {
             if ((dbids & 1) != 0) {
-                redisDb *db = g_pserver->db+dbid;
+                redisDb *db = g_pserver->db[dbid];
 
                 // the expire is hashed based on the key pointer, so we need the point in the main db
-                dictEntry *deMain = dictFind(db->dict, keyname);
-                auto itr = db->setexpire->end();
-                if (deMain != nullptr)
-                    itr = db->setexpire->find((sds)dictGetKey(deMain));
+                auto itrDB = db->find(keyname);
+                auto itrExpire = db->setexpire()->end();
+                if (itrDB != nullptr)
+                    itrExpire = db->setexpireUnsafe()->find(itrDB.key());
                 int expired = 0;
 
-                if (itr != db->setexpire->end())
+                if (itrExpire != db->setexpire()->end())
                 {
-                    if (itr->when() < start) {
+                    if (itrExpire->when() < start) {
                         size_t tried = 0;
-                        expired = activeExpireCycleExpire(g_pserver->db+dbid,*itr,start,tried);
+                        expired = activeExpireCycleExpire(g_pserver->db[dbid],*itrExpire,start,tried);
                     }
                 }
 
@@ -516,7 +515,7 @@ void expireSlaveKeys(void) {
                  * corresponding bit in the new bitmap we set as value.
                  * At the end of the loop if the bitmap is zero, it means we
                  * no longer need to keep track of this key. */
-                if (itr != db->setexpire->end() && !expired) {
+                if (itrExpire != db->setexpire()->end() && !expired) {
                     noexpire++;
                     new_dbids |= (uint64_t)1 << dbid;
                 }
@@ -694,7 +693,8 @@ void ttlGenericCommand(client *c, int output_ms) {
 
     /* The key exists. Return -1 if it has no expire, or the actual
         * TTL value otherwise. */
-    expireEntry *pexpire = getExpire(c->db,c->argv[1]);
+    std::unique_lock<fastlock> ul(g_expireLock);
+    expireEntry *pexpire = c->db->getExpire(c->argv[1]);
 
     if (c->argc == 2) {
         // primary expire    
@@ -752,7 +752,7 @@ void persistCommand(client *c) {
                 addReply(c,shared.czero);
             }
         } else if (c->argc == 3) {
-            if (removeSubkeyExpire(c->db, c->argv[1], c->argv[2])) {
+            if (c->db->removeSubkeyExpire(c->argv[1], c->argv[2])) {
                 signalModifiedKey(c,c->db,c->argv[1]);
                 notifyKeyspaceEvent(NOTIFY_GENERIC,"persist",c->argv[1],c->db->id);
                 addReply(c,shared.cone);
@@ -776,17 +776,23 @@ void touchCommand(client *c) {
     addReplyLongLong(c,touched);
 }
 
-expireEntryFat::expireEntryFat(const expireEntryFat &src)
-{
-    m_keyPrimary = sdsdupshared(src.m_keyPrimary);
-    m_vecexpireEntries = src.m_vecexpireEntries;
-    m_dictIndex = nullptr;
-}
-
 expireEntryFat::~expireEntryFat()
 {
     if (m_dictIndex != nullptr)
         dictRelease(m_dictIndex);
+}
+
+expireEntryFat::expireEntryFat(const expireEntryFat &e)
+    : m_keyPrimary(e.m_keyPrimary), m_vecexpireEntries(e.m_vecexpireEntries)
+{
+    // Note: dictExpires is not copied
+}
+
+expireEntryFat::expireEntryFat(expireEntryFat &&e)
+    : m_keyPrimary(std::move(e.m_keyPrimary)), m_vecexpireEntries(std::move(e.m_vecexpireEntries))
+{
+    m_dictIndex = e.m_dictIndex;
+    e.m_dictIndex = nullptr;
 }
 
 void expireEntryFat::createIndex()

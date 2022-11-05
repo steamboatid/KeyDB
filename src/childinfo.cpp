@@ -69,6 +69,7 @@ void closeChildInfoPipe(void) {
 /* Send save data to parent. */
 void sendChildInfoGeneric(childInfoType info_type, size_t keys, double progress, const char *pname) {
     if (g_pserver->child_info_pipe[1] == -1) return;
+    if (g_pserver->rdbThreadVars.fRdbThreadActive && g_pserver->rdbThreadVars.fRdbThreadCancel) return;
 
     static monotime cow_updated = 0;
     static uint64_t cow_update_cost = 0;

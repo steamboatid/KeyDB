@@ -56,6 +56,7 @@ extern "C" {
 
 /* Unused arguments generate annoying warnings... */
 #define DICT_NOTUSED(V) ((void) V)
+struct dictAsyncRehashCtl;
 
 typedef struct dictEntry {
     void *key;
@@ -76,6 +77,7 @@ typedef struct dictType {
     void (*keyDestructor)(void *privdata, void *key);
     void (*valDestructor)(void *privdata, void *obj);
     int (*expandAllowed)(size_t moreMem, double usedRatio);
+    void (*asyncfree)(dictAsyncRehashCtl *);
 } dictType;
 
 /* This is our hash table structure. Every dictionary has two of this as we
@@ -102,24 +104,49 @@ struct dictAsyncRehashCtl {
     struct dict *dict = nullptr;
     std::vector<workItem> queue;
     size_t hashIdx = 0;
-    bool release = false;
+    long rehashIdxBase;
     dictAsyncRehashCtl *next = nullptr;
     std::atomic<bool> done { false };
+    std::atomic<bool> abondon { false };
 
-    dictAsyncRehashCtl(struct dict *d, dictAsyncRehashCtl *next) : dict(d), next(next) {
-        queue.reserve(c_targetQueueSize);
-    }
+    dictAsyncRehashCtl(struct dict *d, dictAsyncRehashCtl *next);
+    dictAsyncRehashCtl(const dictAsyncRehashCtl&) = delete;
+    dictAsyncRehashCtl(dictAsyncRehashCtl&&) = delete;
+    ~dictAsyncRehashCtl();
 };
 #else
 struct  dictAsyncRehashCtl;
 #endif
+
+void discontinueAsyncRehash(dict *d);
 
 typedef struct dict {
     dictType *type;
     void *privdata;
     dictht ht[2];
     long rehashidx; /* rehashing not in progress if rehashidx == -1 */
+    unsigned refcount;
+    dictAsyncRehashCtl *asyncdata;
     int16_t pauserehash; /* If >0 rehashing is paused (<0 indicates coding error) */
+    uint8_t noshrink = false;
+
+#ifdef __cplusplus
+    dict() = default;
+    dict(dict &) = delete;  // No Copy Ctor
+
+    static void swap(dict& a, dict& b) {
+        discontinueAsyncRehash(&a);
+        discontinueAsyncRehash(&b);
+        std::swap(a.type, b.type);
+        std::swap(a.privdata, b.privdata);
+        std::swap(a.ht[0], b.ht[0]);
+        std::swap(a.ht[1], b.ht[1]);
+        std::swap(a.rehashidx, b.rehashidx);
+        // Never swap refcount - they are attached to the specific dict obj
+        std::swap(a.pauserehash, b.pauserehash);
+        std::swap(a.noshrink, b.noshrink);
+    }
+#endif
 } dict;
 
 /* If safe is set to 1 this is a safe iterator, that means, you can call
@@ -187,8 +214,8 @@ typedef void (dictScanBucketFunction)(void *privdata, dictEntry **bucketref);
 #define dictSlots(d) ((d)->ht[0].size+(d)->ht[1].size)
 #define dictSize(d) ((d)->ht[0].used+(d)->ht[1].used)
 #define dictIsRehashing(d) ((d)->rehashidx != -1)
-#define dictPauseRehashing(d) (d)->pauserehash++
-#define dictResumeRehashing(d) (d)->pauserehash--
+#define dictPauseRehashing(d) __atomic_fetch_add(&(d)->pauserehash, 1, __ATOMIC_SEQ_CST)
+#define dictResumeRehashing(d) __atomic_fetch_sub(&(d)->pauserehash, 1, __ATOMIC_SEQ_CST)
 
 /* If our unsigned long type can store a 64 bit number, use a 64 bit PRNG. */
 #if ULONG_MAX >= 0xffffffffffffffff
@@ -199,9 +226,9 @@ typedef void (dictScanBucketFunction)(void *privdata, dictEntry **bucketref);
 
 /* API */
 dict *dictCreate(dictType *type, void *privDataPtr);
-int dictExpand(dict *d, unsigned long size);
-int dictTryExpand(dict *d, unsigned long size);
-int dictAdd(dict *d, void *key, void *val);
+int dictExpand(dict *d, unsigned long size, bool fShrink = false);
+int dictTryExpand(dict *d, unsigned long size, bool fShrink);
+int dictAdd(dict *d, void *key, void *val, dictEntry **existing = nullptr);
 dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing);
 dictEntry *dictAddOrFind(dict *d, void *key);
 int dictReplace(dict *d, void *key, void *val);
@@ -210,6 +237,7 @@ dictEntry *dictUnlink(dict *ht, const void *key);
 void dictFreeUnlinkedEntry(dict *d, dictEntry *he);
 void dictRelease(dict *d);
 dictEntry * dictFind(dict *d, const void *key);
+dictEntry * dictFindWithPrev(dict *d, const void *key, uint64_t h, dictEntry ***dePrevPtr, dictht **ht, bool fShallowCompare = false);
 void *dictFetchValue(dict *d, const void *key);
 int dictResize(dict *d);
 dictIterator *dictGetIterator(dict *d);
@@ -232,6 +260,14 @@ uint8_t *dictGetHashFunctionSeed(void);
 unsigned long dictScan(dict *d, unsigned long v, dictScanFunction *fn, dictScanBucketFunction *bucketfn, void *privdata);
 uint64_t dictGetHash(dict *d, const void *key);
 dictEntry **dictFindEntryRefByPtrAndHash(dict *d, const void *oldptr, uint64_t hash);
+void dictForceRehash(dict *d);
+int dictMerge(dict *dst, dict *src);
+
+/* Async API */
+dictAsyncRehashCtl *dictRehashAsyncStart(dict *d, int buckets);
+bool dictRehashSomeAsync(dictAsyncRehashCtl *ctl, size_t hashes);
+void dictCompleteRehashAsync(dictAsyncRehashCtl *ctl, bool fFree);
+void dictRehashAsync(dictAsyncRehashCtl *ctl);
 
 /* Hash table types */
 extern dictType dictTypeHeapStringCopyKey;

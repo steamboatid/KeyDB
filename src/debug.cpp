@@ -78,6 +78,7 @@ void bugReportStart(void);
 void printCrashReport(void);
 void bugReportEnd(int killViaSignal, int sig);
 void logStackTrace(void *eip, int uplevel);
+void getTempFileName(char tmpfile[], int tmpfileNum);
 
 /* ================================= Debugging ============================== */
 
@@ -148,7 +149,8 @@ void mixStringObjectDigest(unsigned char *digest, robj_roptr o) {
 void xorObjectDigest(redisDb *db, robj_roptr keyobj, unsigned char *digest, robj_roptr o) {
     uint32_t aux = htonl(o->type);
     mixDigest(digest,&aux,sizeof(aux));
-    expireEntry *pexpire = getExpire(db,keyobj);
+    std::unique_lock<fastlock> ul(g_expireLock);
+    expireEntry *pexpire = db->getExpire(keyobj);
     long long expiretime = INVALID_EXPIRE;
     char buf[128];
 
@@ -291,19 +293,15 @@ void xorObjectDigest(redisDb *db, robj_roptr keyobj, unsigned char *digest, robj
  * as input in order to ensure that a different ordered list will result in
  * a different digest. */
 void computeDatasetDigest(unsigned char *final) {
-    unsigned char digest[20];
-    dictIterator *di = NULL;
-    dictEntry *de;
     int j;
     uint32_t aux;
 
     memset(final,0,20); /* Start with a clean result */
 
     for (j = 0; j < cserver.dbnum; j++) {
-        redisDb *db = g_pserver->db+j;
+        redisDb *db = g_pserver->db[j];
 
-        if (dictSize(db->dict) == 0) continue;
-        di = dictGetSafeIterator(db->dict);
+        if (db->size() == 0) continue;
 
         /* hash the DB id, so the same dataset moved in a different
          * DB will lead to a different digest */
@@ -311,24 +309,22 @@ void computeDatasetDigest(unsigned char *final) {
         mixDigest(final,&aux,sizeof(aux));
 
         /* Iterate this DB writing every entry */
-        while((de = dictNext(di)) != NULL) {
-            sds key;
-            robj *keyobj, *o;
+        db->iterate_threadsafe([final, db](const char *key, robj_roptr o)->bool {
+            unsigned char digest[20];
+            robj *keyobj;
 
             memset(digest,0,20); /* This key-val digest */
-            key = (sds)dictGetKey(de);
             keyobj = createStringObject(key,sdslen(key));
 
             mixDigest(digest,key,sdslen(key));
 
-            o = (robj*)dictGetVal(de);
             xorObjectDigest(db,keyobj,digest,o);
 
             /* We can finally xor the key-val digest to the final digest */
             xorDigest(final,digest,20);
             decrRefCount(keyobj);
-        }
-        dictReleaseIterator(di);
+            return true;
+        });
     }
 }
 
@@ -546,7 +542,7 @@ NULL
         if (save) {
             rdbSaveInfo rsi, *rsiptr;
             rsiptr = rdbPopulateSaveInfo(&rsi);
-            if (rdbSaveFile(g_pserver->rdb_filename,rsiptr) != C_OK) {
+            if (rdbSave(nullptr, rsiptr) != C_OK) {
                 addReply(c,shared.err);
                 return;
             }
@@ -580,15 +576,14 @@ NULL
         serverLog(LL_WARNING,"Append Only File loaded by DEBUG LOADAOF");
         addReply(c,shared.ok);
     } else if (!strcasecmp(szFromObj(c->argv[1]),"object") && c->argc == 3) {
-        dictEntry *de;
         robj *val;
         const char *strenc;
 
-        if ((de = dictFind(c->db->dict,ptrFromObj(c->argv[2]))) == NULL) {
+        val = c->db->find(c->argv[2]);
+        if (val == NULL) {
             addReplyErrorObject(c,shared.nokeyerr);
             return;
         }
-        val = (robj*)dictGetVal(de);
         strenc = strEncoding(val->encoding);
 
         char extra[138] = {0};
@@ -632,16 +627,14 @@ NULL
             strenc, rdbSavedObjectLen(val, c->argv[2]),
             val->lru, estimateObjectIdleTime(val)/1000, extra);
     } else if (!strcasecmp(szFromObj(c->argv[1]),"sdslen") && c->argc == 3) {
-        dictEntry *de;
-        robj *val;
-        sds key;
+        auto itr = c->db->find(c->argv[2]);
+        robj *val = itr.val();
+        const char *key = itr.key();
 
-        if ((de = dictFind(c->db->dict,ptrFromObj(c->argv[2]))) == NULL) {
+        if (val == NULL) {
             addReplyErrorObject(c,shared.nokeyerr);
             return;
         }
-        val = (robj*)dictGetVal(de);
-        key = (sds)dictGetKey(de);
 
         if (val->type != OBJ_STRING || !sdsEncodedObject(val)) {
             addReplyError(c,"Not an sds encoded string.");
@@ -651,7 +644,7 @@ NULL
                 "val_sds_len:%lld, val_sds_avail:%lld, val_zmalloc: %lld",
                 (long long) sdslen(key),
                 (long long) sdsavail(key),
-                (long long) sdsZmallocSize(key),
+                (long long) sdsZmallocSize((sds)key),
                 (long long) sdslen(szFromObj(val)),
                 (long long) sdsavail(szFromObj(val)),
                 (long long) getStringObjectSdsUsedMemory(val));
@@ -676,8 +669,8 @@ NULL
 
         if (getPositiveLongFromObjectOrReply(c, c->argv[2], &keys, NULL) != C_OK)
             return;
-
-        dictExpand(c->db->dict,keys);
+        
+        c->db->expand(keys);
         long valsize = 0;
         if ( c->argc == 5 && getPositiveLongFromObjectOrReply(c, c->argv[4], &valsize, NULL) != C_OK ) 
             return;
@@ -721,8 +714,8 @@ NULL
 
             /* We don't use lookupKey because a debug command should
              * work on logically expired keys */
-            dictEntry *de;
-            robj *o = (robj*)((de = dictFind(c->db->dict,ptrFromObj(c->argv[j]))) == NULL) ? NULL : (robj*)dictGetVal(de);
+            auto itr = c->db->find(c->argv[j]);
+            robj* o = (robj*)(itr == NULL ? NULL : itr.val());
             if (o) xorObjectDigest(c->db,c->argv[j],digest,o);
 
             sds d = sdsempty();
@@ -847,11 +840,11 @@ NULL
         }
 
         stats = sdscatprintf(stats,"[Dictionary HT]\n");
-        dictGetStats(buf,sizeof(buf),g_pserver->db[dbid].dict);
+        g_pserver->db[dbid]->getStats(buf,sizeof(buf));
         stats = sdscat(stats,buf);
 
         stats = sdscatprintf(stats,"[Expires set]\n");
-        g_pserver->db[dbid].setexpire->getstats(buf, sizeof(buf));
+        g_pserver->db[dbid]->getExpireStats(buf, sizeof(buf));
         stats = sdscat(stats, buf);
 
         addReplyVerbatim(c,stats,sdslen(stats),"txt");
@@ -913,6 +906,10 @@ NULL
             c->flags &= ~(CLIENT_MASTER | CLIENT_MASTER_FORCE_REPLY);
         }
         addReply(c, shared.ok);
+    } else if (!strcasecmp(szFromObj(c->argv[1]), "get-temp-file") && c->argc == 2) {
+        char tmpfile[256];
+        getTempFileName(tmpfile, g_pserver->rdbThreadVars.tmpfileNum);
+        addReplyBulkCString(c, tmpfile);
     } else if (!strcasecmp(szFromObj(c->argv[1]),"truncate-repl-backlog") && c->argc == 2) {
         g_pserver->repl_backlog_idx = 0;
         g_pserver->repl_backlog_off = g_pserver->master_repl_offset+1;
@@ -1793,12 +1790,10 @@ void logCurrentClient(void) {
      * selected DB, and if so print info about the associated object. */
     if (cc->argc > 1) {
         robj *val, *key;
-        dictEntry *de;
 
         key = getDecodedObject(cc->argv[1]);
-        de = dictFind(cc->db->dict, ptrFromObj(key));
-        if (de) {
-            val = (robj*)dictGetVal(de);
+        val = cc->db->find(key);
+        if (val) {
             serverLog(LL_WARNING,"key '%s' found in DB containing the following object:", (char*)ptrFromObj(key));
             serverLogObjectDebugInfo(val);
         }

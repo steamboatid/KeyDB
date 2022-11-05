@@ -1139,6 +1139,8 @@ void bitfieldGeneric(client *c, int flags) {
 
                 oldval = getSignedBitfield((unsigned char*)ptrFromObj(o),thisop->offset,
                         thisop->bits);
+								retval = thisop->i64;
+								newval = thisop->i64;
 
                 if (thisop->opcode == BITFIELDOP_INCRBY) {
                     newval = oldval + thisop->i64;
@@ -1169,8 +1171,8 @@ void bitfieldGeneric(client *c, int flags) {
 
                 oldval = getUnsignedBitfield((unsigned char*)ptrFromObj(o),thisop->offset,
                         thisop->bits);
-								retval = oldval;
-								newval = oldval;
+								retval = thisop->i64;
+								newval = thisop->i64;
 
                 if (thisop->opcode == BITFIELDOP_INCRBY) {
                     newval = oldval + thisop->i64;

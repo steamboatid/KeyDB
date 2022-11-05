@@ -413,15 +413,15 @@ void touchAllWatchedKeysInDb(redisDb *emptied, redisDb *replaced_with) {
 
     dictIterator *di = dictGetSafeIterator(emptied->watched_keys);
     while((de = dictNext(di)) != NULL) {
-        robj *key = (robj*)dictGetKey(de);
-        list *clients = (list*)dictGetVal(de);
+        robj *key = (robj*)de->key;
+        list *clients = (list*)de->v.val;
         if (!clients) continue;
         listRewind(clients,&li);
         while((ln = listNext(&li))) {
             client *c = (client*)listNodeValue(ln);
-            if (dictFind(emptied->dict, ptrFromObj(key))) {
+            if (emptied->find(key)) {
                 c->flags |= CLIENT_DIRTY_CAS;
-            } else if (replaced_with && dictFind(replaced_with->dict, ptrFromObj(key))) {
+            } else if (replaced_with && replaced_with->find(key)) {
                 c->flags |= CLIENT_DIRTY_CAS;
             }
         }

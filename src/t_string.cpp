@@ -29,6 +29,7 @@
 
 #include "server.h"
 #include <cmath> /* isnan(), isinf() */
+#include "aelocker.h"
 
 /* Forward declarations */
 int getGenericCommand(client *c);
@@ -284,8 +285,9 @@ void psetexCommand(client *c) {
 
 int getGenericCommand(client *c) {
     robj_roptr o;
+    AeLocker locker;
 
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp])) == nullptr)
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp],locker)) == nullptr)
         return C_OK;
 
     if (checkType(c,o,OBJ_STRING)) {
@@ -524,19 +526,14 @@ void getrangeCommand(client *c) {
 }
 
 void mgetCommand(client *c) {
-    int j;
-
+    AeLocker locker;
     addReplyArrayLen(c,c->argc-1);
-    for (j = 1; j < c->argc; j++) {
-        robj_roptr o = lookupKeyRead(c->db,c->argv[j]);
-        if (o == nullptr) {
+    for (int i = 1; i < c->argc; i++) {
+        robj_roptr o = lookupKeyRead(c->db,c->argv[i],c->mvccCheckpoint,locker);
+        if (o == nullptr || o->type != OBJ_STRING) {
             addReplyNull(c);
         } else {
-            if (o->type != OBJ_STRING) {
-                addReplyNull(c);
-            } else {
-                addReplyBulk(c,o);
-            }
+            addReplyBulk(c,o);
         }
     }
 }

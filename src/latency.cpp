@@ -230,7 +230,7 @@ void analyzeLatencyForEvent(char *event, struct latencyStats *ls) {
     if (ls->samples) ls->mad = sum / ls->samples;
 }
 
-/* Create a human readable report of latency events for this Redis instance. */
+/* Create a human readable report of latency events for this KeyDB instance. */
 sds createLatencyReport(void) {
     sds report = sdsempty();
     int advise_better_vm = 0;       /* Better virtual machines. */
@@ -256,7 +256,7 @@ sds createLatencyReport(void) {
     if (dictSize(g_pserver->latency_events) == 0 &&
         g_pserver->latency_monitor_threshold == 0)
     {
-        report = sdscat(report,"I'm sorry, Dave, I can't do that. Latency monitoring is disabled in this KeyDB instance. You may use \"CONFIG SET latency-monitor-threshold <milliseconds>.\" in order to enable it. If we weren't in a deep space mission I'd suggest to take a look at https://redis.io/topics/latency-monitor.\n");
+        report = sdscat(report,"I'm sorry, Dave, I can't do that. Latency monitoring is disabled in this KeyDB instance. You may use \"CONFIG SET latency-monitor-threshold <milliseconds>.\" in order to enable it.\n");
         return report;
     }
 
@@ -398,7 +398,7 @@ sds createLatencyReport(void) {
     dictReleaseIterator(di);
 
     /* Add non event based advices. */
-    if (THPGetAnonHugePagesSize() > 0) {
+    if (g_pserver->aof_enabled && THPGetAnonHugePagesSize() > 0) {
         advise_disable_thp = 1;
         advices++;
     }

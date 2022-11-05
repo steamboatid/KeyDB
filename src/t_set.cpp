@@ -69,7 +69,8 @@ int setTypeAdd(robj *subject, const char *value) {
                 size_t max_entries = g_pserver->set_max_intset_entries;
                 /* limit to 1G entries due to intset internals. */
                 if (max_entries >= 1<<30) max_entries = 1<<30;
-                if (intsetLen((intset*)subject->m_ptr) > max_entries && 
+								/*//dkmods*/
+                if (intsetLen((intset*)subject->m_ptr) > max_entries &&
                     g_pserver->auto_convert_intset_encoding > 0)
                     setTypeConvert(subject,OBJ_ENCODING_HT);
                 return 1;
@@ -89,6 +90,7 @@ int setTypeAdd(robj *subject, const char *value) {
     return 0;
 }
 
+//dkmods
 int setTypeAddInt(robj *subject, const char *value) {
     long long llval;
     if (subject->encoding == OBJ_ENCODING_INTSET) {
@@ -239,9 +241,9 @@ int setTypeRandomElement(robj *setobj, sds *sdsele, int64_t *llele) {
     return setobj->encoding;
 }
 
-int setTypeRandomElement(robj_roptr setobj, const char **sdsele, const int64_t *llele)
+int setTypeRandomElement(robj_roptr setobj, const char **sdsele, int64_t *llele)
 {
-    return setTypeRandomElement(setobj.unsafe_robjcast(), (sds*)sdsele, const_cast<int64_t*>(llele));
+    return setTypeRandomElement(setobj.unsafe_robjcast(), (sds*)sdsele, llele);
 }
 
 unsigned long setTypeSize(robj_roptr subject) {
@@ -335,6 +337,7 @@ void saddCommand(client *c) {
     }
 
     for (j = 2; j < c->argc; j++) {
+        /*//dkmods*/
         if (set->encoding == OBJ_ENCODING_INTSET && 
           g_pserver->auto_convert_intset_encoding == 0){
 					if (setTypeAddInt(set,szFromObj(c->argv[j]))) added++;
@@ -353,6 +356,7 @@ void saddCommand(client *c) {
     addReplyLongLong(c,added);
 }
 
+//dkmods
 void saddintCommand(client *c) {
     robj *set;
     int j, added = 0;

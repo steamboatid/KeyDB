@@ -14,6 +14,8 @@ if {$system_name eq {linux}} {
             return $val
         }
 
+        # The test below relies upon forking bg save which we don't do
+        if 0 {
         test {CONFIG SET oom-score-adj works as expected} {
             set base [get_oom_score_adj]
 
@@ -45,7 +47,7 @@ if {$system_name eq {linux}} {
             } else {
                 fail "Set oom-score-adj of background child process is not ok"
             }
-        }
+        } }
 
         # Failed oom-score-adj tests can only run unprivileged
         if {$user_id != 0} {

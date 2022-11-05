@@ -851,6 +851,7 @@ long defragModule(redisDb *db, dictEntry *kde) {
  * all the various pointers it has. Returns a stat of how many pointers were
  * moved. */
 long defragKey(redisDb *db, dictEntry *de) {
+    std::unique_lock<fastlock> ul(g_expireLock);
     sds keysds = (sds)dictGetKey(de);
     robj *newob, *ob;
     unsigned char *newzl;
@@ -864,15 +865,14 @@ long defragKey(redisDb *db, dictEntry *de) {
     if (newsds)
     {
         defragged++, de->key = newsds;
-        if (!db->setexpire->empty()) {
-            bool fReplaced = replaceSatelliteOSetKeyPtr(*db->setexpire, keysds, newsds);
+        if (!db->setexpire()->empty()) {
+            bool fReplaced = replaceSatelliteOSetKeyPtr(*const_cast<expireset*>(db->setexpire()), keysds, newsds);
             serverAssert(fReplaced == ob->FExpires());
         } else {
             serverAssert(!ob->FExpires());
         }
     }
 
-    /* Try to defrag robj and / or string value. */
     if ((newob = activeDefragStringOb(ob, &defragged))) {
         de->v.val = newob;
         ob = newob;
@@ -989,9 +989,8 @@ long defragOtherGlobals() {
 
 /* returns 0 more work may or may not be needed (see non-zero cursor),
  * and 1 if time is up and more work is needed. */
-int defragLaterItem(dictEntry *de, unsigned long *cursor, long long endtime) {
-    if (de) {
-        robj *ob = (robj*)dictGetVal(de);
+int defragLaterItem(sds key, robj *ob, unsigned long *cursor, long long endtime) {
+    if (ob) {
         if (ob->type == OBJ_LIST) {
             return scanLaterList(ob, cursor, endtime, &g_pserver->stat_active_defrag_hits);
         } else if (ob->type == OBJ_SET) {
@@ -1003,7 +1002,9 @@ int defragLaterItem(dictEntry *de, unsigned long *cursor, long long endtime) {
         } else if (ob->type == OBJ_STREAM) {
             return scanLaterStreamListpacks(ob, cursor, endtime, &g_pserver->stat_active_defrag_hits);
         } else if (ob->type == OBJ_MODULE) {
-            return moduleLateDefrag((robj*)dictGetKey(de), ob, cursor, endtime, &g_pserver->stat_active_defrag_hits);
+            redisObjectStack oT;
+            initStaticStringObject(oT, key);
+            return moduleLateDefrag(&oT, ob, cursor, endtime, &g_pserver->stat_active_defrag_hits);
         } else {
             *cursor = 0; /* object type may have changed since we schedule it for later */
         }
@@ -1048,11 +1049,11 @@ int defragLaterStep(redisDb *db, long long endtime) {
         }
 
         /* each time we enter this function we need to fetch the key from the dict again (if it still exists) */
-        dictEntry *de = dictFind(db->dict, defrag_later_current_key);
+        robj *o = db->find(defrag_later_current_key);
         key_defragged = g_pserver->stat_active_defrag_hits;
         do {
             int quit = 0;
-            if (defragLaterItem(de, &defrag_later_cursor, endtime))
+            if (defragLaterItem(defrag_later_current_key, o, &defrag_later_cursor, endtime))
                 quit = 1; /* time is up, we didn't finish all the work */
 
             /* Once in 16 scan iterations, 512 pointer reallocations, or 64 fields
@@ -1200,7 +1201,7 @@ void activeDefragCycle(void) {
                 start_stat = g_pserver->stat_active_defrag_hits;
             }
 
-            db = &g_pserver->db[current_db];
+            db = g_pserver->db[current_db];
             cursor = 0;
         }
 
@@ -1211,7 +1212,8 @@ void activeDefragCycle(void) {
                 break; /* this will exit the function and we'll continue on the next cycle */
             }
 
-            cursor = dictScan(db->dict, cursor, defragScanCallback, defragDictBucketCallback, db);
+            // we actually look at the objects too but defragScanCallback can handle missing values
+            cursor = dictScan(db->dictUnsafeKeyOnly(), cursor, defragScanCallback, defragDictBucketCallback, db);
 
             /* Once in 16 scan iterations, 512 pointer reallocations. or 64 keys
              * (if we have a lot of pointers in one hash bucket or rehasing),

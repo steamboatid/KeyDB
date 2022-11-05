@@ -41,21 +41,22 @@ public:
     };
 
 private:
-    sds m_keyPrimary;
+    sdsimmutablestring m_keyPrimary;
     std::vector<subexpireEntry> m_vecexpireEntries;  // Note a NULL for the sds portion means the expire is for the primary key
     dict *m_dictIndex = nullptr;
 
     void createIndex();
 public:
-    expireEntryFat(sds keyPrimary)
+    expireEntryFat(const sdsimmutablestring &keyPrimary)
         : m_keyPrimary(keyPrimary)
         {}
-    expireEntryFat(const expireEntryFat &);
     ~expireEntryFat();
 
-    long long when() const noexcept { return m_vecexpireEntries.front().when; }
+    expireEntryFat(const expireEntryFat &e);
+    expireEntryFat(expireEntryFat &&e);
 
-    const char *key() const noexcept { return m_keyPrimary; }
+    long long when() const noexcept { return m_vecexpireEntries.front().when; }
+    const char *key() const noexcept { return static_cast<const char*>(m_keyPrimary); }
 
     bool operator<(long long when) const noexcept { return this->when() <  when; }
 
@@ -64,15 +65,15 @@ public:
     bool FEmpty() const noexcept { return m_vecexpireEntries.empty(); }
     const subexpireEntry &nextExpireEntry() const noexcept { return m_vecexpireEntries.front(); }
     void popfrontExpireEntry();
-    const subexpireEntry &operator[](size_t idx) { return m_vecexpireEntries[idx]; }
+    const subexpireEntry &operator[](size_t idx) const { return m_vecexpireEntries[idx]; }
     size_t size() const noexcept { return m_vecexpireEntries.size(); }
 };
 
 class expireEntry {
-    union
+    struct
     {
-        sds m_key;
-        expireEntryFat *m_pfatentry;
+        sdsimmutablestring m_key;
+        expireEntryFat *m_pfatentry = nullptr;
     } u;
     long long m_when;   // bit wise and with FFatMask means this is a fat entry and we should use the pointer
 
@@ -86,11 +87,11 @@ public:
     class iter
     {
         friend class expireEntry;
-        expireEntry *m_pentry = nullptr;
+        const expireEntry *m_pentry = nullptr;
         size_t m_idx = 0;
 
     public:
-        iter(expireEntry *pentry, size_t idx)
+        iter(const expireEntry *pentry, size_t idx)
             : m_pentry(pentry), m_idx(idx)
         {}
 
@@ -122,14 +123,27 @@ public:
         if (subkey != nullptr)
         {
             m_when = FFatMask() | INVALID_EXPIRE;
-            u.m_pfatentry = new (MALLOC_LOCAL) expireEntryFat(key);
+            u.m_pfatentry = new (MALLOC_LOCAL) expireEntryFat(sdsimmutablestring(sdsdupshared(key)));
             u.m_pfatentry->expireSubKey(subkey, when);
         }
         else
         {
-            u.m_key = key;
+            u.m_key = sdsimmutablestring(sdsdupshared(key));
             m_when = when;
         }
+    }
+
+    expireEntry(const expireEntry &e)
+    {
+        *this = e;
+    }
+    expireEntry(expireEntry &&e)
+    {
+        u.m_key = std::move(e.u.m_key);
+        u.m_pfatentry = std::move(e.u.m_pfatentry);
+        m_when = e.m_when;
+        e.m_when = 0;
+        e.u.m_pfatentry = nullptr;
     }
 
     expireEntry(expireEntryFat *pfatentry)
@@ -144,14 +158,6 @@ public:
                 break;
             }
         }
-    }
-
-    expireEntry(expireEntry &&e)
-    {
-        u.m_key = e.u.m_key;
-        m_when = e.m_when;
-        e.u.m_key = (char*)key();  // we do this so it can still be found in the set
-        e.m_when = 0;
     }
 
     // Duplicate the expire, note this is intended to be passed directly to setExpire
@@ -172,21 +178,31 @@ public:
             delete u.m_pfatentry;
     }
 
+    expireEntry &operator=(const expireEntry &e)
+    {
+        u.m_key = e.u.m_key;
+        m_when = e.m_when;
+        if (e.FFat())
+            u.m_pfatentry = new (MALLOC_LOCAL) expireEntryFat(*e.u.m_pfatentry);
+        return *this;
+    }
+
     void setKeyUnsafe(sds key)
     {
         if (FFat())
-            u.m_pfatentry->m_keyPrimary = key;
+            u.m_pfatentry->m_keyPrimary = sdsimmutablestring(sdsdupshared(key));
         else
-            u.m_key = key;
+            u.m_key = sdsimmutablestring(sdsdupshared(key));
     }
 
     inline bool FFat() const noexcept { return m_when & FFatMask(); }
     expireEntryFat *pfatentry() { assert(FFat()); return u.m_pfatentry; }
+    const expireEntryFat *pfatentry() const { assert(FFat()); return u.m_pfatentry; }
 
 
-    bool operator==(const char *key) const noexcept
+    bool operator==(const sdsview &key) const noexcept
     { 
-        return this->key() == key; 
+        return key == this->key(); 
     }
 
     bool operator<(const expireEntry &e) const noexcept
@@ -202,7 +218,7 @@ public:
     { 
         if (FFat())
             return u.m_pfatentry->key();
-        return u.m_key;
+        return static_cast<const char*>(u.m_key);
     }
     long long when() const noexcept
     { 
@@ -224,7 +240,7 @@ public:
             {
                 // we have to upgrade to a fat entry
                 long long whenT = m_when;
-                sds keyPrimary = u.m_key;
+                sdsimmutablestring keyPrimary = u.m_key;
                 m_when |= FFatMask();
                 u.m_pfatentry = new (MALLOC_LOCAL) expireEntryFat(keyPrimary);
                 u.m_pfatentry->expireSubKey(nullptr, whenT);
@@ -236,8 +252,8 @@ public:
         u.m_pfatentry->expireSubKey(subkey, when);
     }
     
-    iter begin() { return iter(this, 0); }
-    iter end()
+    iter begin() const { return iter(this, 0); }
+    iter end() const
     {
         if (FFat())
             return iter(this, u.m_pfatentry->size());
@@ -252,6 +268,13 @@ public:
             pfatentry()->m_vecexpireEntries.begin() + itr.m_idx);
     }
 
+    size_t size() const
+    {
+        if (FFat())
+            return u.m_pfatentry->size();
+        return 1;
+    }
+
     long long FGetPrimaryExpire() const noexcept
     { 
         return m_when & (~FFatMask()); 
@@ -263,7 +286,8 @@ public:
         return *pwhen != INVALID_EXPIRE;
     }
 
-    explicit operator const char*() const noexcept { return key(); }
+    explicit operator sdsview() const noexcept { return key(); }
     explicit operator long long() const noexcept { return when(); }
 };
-typedef semiorderedset<expireEntry, const char *, true /*expireEntry can be memmoved*/> expireset;
+typedef semiorderedset<expireEntry, sdsview, true /*expireEntry can be memmoved*/> expireset;
+extern fastlock g_expireLock;

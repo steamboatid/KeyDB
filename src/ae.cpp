@@ -128,9 +128,13 @@ struct aeCommand
     };
     void *clientData;
 };
+#ifdef PIPE_BUF
+static_assert(sizeof(aeCommand) <= PIPE_BUF, "aeCommand must be small enough to send atomically through a pipe");
+#endif
 
 void aeProcessCmd(aeEventLoop *eventLoop, int fd, void *, int )
 {
+    std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock);
     aeCommand cmd;
     for (;;)
     {
@@ -152,8 +156,7 @@ void aeProcessCmd(aeEventLoop *eventLoop, int fd, void *, int )
 
         case AE_ASYNC_OP::PostFunction:
             {
-            std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock);
-            if (cmd.fLock) {
+            if (cmd.fLock && !ulock.owns_lock()) {
                 g_forkLock.releaseRead();
                 ulock.lock();
                 g_forkLock.acquireRead();
@@ -164,8 +167,7 @@ void aeProcessCmd(aeEventLoop *eventLoop, int fd, void *, int )
 
         case AE_ASYNC_OP::PostCppFunction:
         {
-            std::unique_lock<decltype(g_lock)> ulock(g_lock, std::defer_lock);
-            if (cmd.fLock) {
+            if (cmd.fLock && !ulock.owns_lock()) {
                 g_forkLock.releaseRead();
                 ulock.lock();
                 g_forkLock.acquireRead();
@@ -264,7 +266,7 @@ int aePostFunction(aeEventLoop *eventLoop, std::function<void()> fn, bool fLock,
 
     aeCommand cmd = {};
     cmd.op = AE_ASYNC_OP::PostCppFunction;
-    cmd.pfn = new (MALLOC_LOCAL) std::function<void()>(fn);
+    cmd.pfn = new std::function<void()>(fn);
     cmd.fLock = fLock;
 
     auto size = write(eventLoop->fdCmdWrite, &cmd, sizeof(cmd));
@@ -809,6 +811,7 @@ void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *aftersleep, 
 }
 
 thread_local spin_worker tl_worker = nullptr;
+thread_local bool fOwnLockOverride = false;
 void setAeLockSetThreadSpinWorker(spin_worker worker)
 {
     tl_worker = worker;
@@ -846,6 +849,11 @@ void aeReleaseLock()
     g_lock.unlock();
 }
 
+void aeSetThreadOwnsLockOverride(int fOverride)
+{
+    fOwnLockOverride = fOverride;
+}
+
 void aeReleaseForkLock()
 {
     g_forkLock.downgradeWrite();
@@ -853,7 +861,25 @@ void aeReleaseForkLock()
 
 int aeThreadOwnsLock()
 {
-    return g_lock.fOwnLock();
+    return fOwnLockOverride || g_lock.fOwnLock();
+}
+
+int aeLockContested(int threshold)
+{
+    ticket ticketT;
+    __atomic_load(&g_lock.m_ticket.u, &ticketT.u, __ATOMIC_RELAXED);
+    return ticketT.m_active < static_cast<uint16_t>(ticketT.m_avail - threshold);
+}
+
+int aeLockContention()
+{
+    ticket ticketT;
+    __atomic_load(&g_lock.m_ticket.u, &ticketT.u, __ATOMIC_RELAXED);
+    int32_t avail = ticketT.m_avail;
+    int32_t active = ticketT.m_active;
+    if (avail < active)
+        avail += 0x10000;
+    return avail - active;
 }
 
 void aeClosePipesForForkChild(aeEventLoop *el)

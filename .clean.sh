@@ -3,5 +3,5 @@
 adir=$(dirname $0)
 cd $adir
 
-make clean
+#make clean
 fakeroot debian/rules clean
