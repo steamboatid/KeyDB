@@ -2281,6 +2281,7 @@ struct redisServer {
     dict *commands;             /* Command table */
     dict *orig_commands;        /* Command table before command renaming. */
 
+
     struct redisServerThreadVars rgthreadvar[MAX_EVENT_LOOPS];
     struct redisServerThreadVars modulethreadvar; /* Server thread local variables to be used by module threads */
     pthread_t rgthread[MAX_EVENT_LOOPS];
@@ -3996,4 +3997,3 @@ class ShutdownException
 int iAmMaster(void);
 
 #endif
-

@@ -471,4 +471,3 @@ const char *connGetInfo(connection *conn, char *buf, size_t buf_len) {
     snprintf(buf, buf_len-1, "fd=%i", conn == NULL ? -1 : conn->fd);
     return buf;
 }
-
